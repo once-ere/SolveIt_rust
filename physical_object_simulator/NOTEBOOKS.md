@@ -97,7 +97,11 @@ Out[19]= 4
 final, reviewed binary — this is the transcript quoted in
 `grammar.md` Example 13, `physical_object_simulator.md` S13 and
 `collision_detection.md` Example 11, and it reproduces **byte-for-byte
-in a fresh clone** of the published repository.
+in a fresh clone** of the published repository. (Re-captured after the
+second adversarial review pass: its directed-support arithmetic fixes
+moved only the floating-point tails — E by one ulp, the momentum
+components at the 10th significant digit — while the 2121 solver
+steps, the 119 collisions and |ΔE/E| = 2.040·10⁻¹⁰ are unchanged.)
 *What it verifies:* E₀ = ½·1·(100²+200²+100²) = 30000 exactly;
 elastic conservation |ΔE/E| = 2.040·10⁻¹⁰ through 119 collisions; the
 infinitely massive walls absorb momentum ((100,200,100) →
@@ -114,9 +118,9 @@ Cells `In[1]`–`In[14]` and `In[19]` are identical to Notebook 1
 In[15]:= run 0.1 steps 100
 Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10, 119 collision(s) — CONTACTS lists them)
 In[16]:= energy
-Out[16]= 29999.99999388012
+Out[16]= 29999.999993880127
 In[17]:= momentum
-Out[17]= [146.4891109312449, 102.14781200712048, 46.01601279520784]
+Out[17]= [146.48911126803657, 102.1478121131382, 46.01601291636828]
 In[18]:= get system.collisions
 Out[18]= 119
 ```
@@ -571,6 +575,6 @@ Raw capture files (session scratch): `demo1.log` (Notebook 1),
 `posim_out3` (7), `machine_session.txt` (8). Notebooks 2 and 6 were
 additionally re-executed inside a fresh clone of
 `https://github.com/once-ere/SolveIt_rust` and matched these
-transcripts byte-for-byte; the suite in Part IV (100 tests:
-39 lib + 16 collision + 9 conservation + 36 posim) is green in the
+transcripts byte-for-byte; the suite in Part IV (103 tests:
+40 lib + 16 collision + 9 conservation + 38 posim) is green in the
 same clone with zero warnings.

@@ -97,6 +97,20 @@ def main():
     status, out = run_cell(kc, "energy")
     check("cell 5: ENERGY observable", status == "ok" and len(out) == 1, f"{status} {out}")
 
+    # A MULTI-LINE DEF in one Jupyter cell must travel as ONE exec
+    # (the kernel joins brace-continuation lines like the notebook).
+    status, out = run_cell(
+        kc,
+        'def probe(m = 4) {\n  new sphere as pk { mass = m }\n}\nprobe()',
+    )
+    check(
+        "cell 6: multi-line DEF defines and calls",
+        status == "ok" and any("obj" in o and "pk" in o for o in out),
+        f"{status} {out}",
+    )
+    status, out = run_cell(kc, "get pk.mass")
+    check("cell 7: named path after DEF call", status == "ok" and out == ["4"], f"{status} {out}")
+
     kc.stop_channels()
     km.shutdown_kernel(now=False)
 

@@ -15,8 +15,8 @@ rod as ONE rigid body, exact part-wise collisions conserving E, P and
 L through real solver events); the scene window gains a permanent
 Reset button (with `SCENE RESET` — bit-identical re-initialization,
 Start re-runs) and a live labeled conserved-quantities readout (E, P
-and L); 99 tests green (39 lib + 16 collision + 9 conservation +
-35 posim).
+and L); 103 tests green (40 lib + 16 collision + 9 conservation +
+38 posim).
 
 - `physical_object/` — library: `pub struct physical_object`, the
   unique union of the legacy `PointParticle`, `RigidBody` and

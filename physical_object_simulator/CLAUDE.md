@@ -122,8 +122,8 @@ read-only donors; the C reference for sundials lives in
   strategy.
 - Commit after every coherent file group; keep
   `cargo build --workspace` warning-free and `cargo test --workspace`
-  green at every commit (99 tests: 39 lib + 16 collision +
-  9 conservation + 35 posim). Phase gates are tagged
+  green at every commit (103 tests: 40 lib + 16 collision +
+  9 conservation + 38 posim). Phase gates are tagged
   (`phase-posim-green`).
 - New solver features need: a unit or conservation test with an
   analytic expectation, a grammar hook if user-facing (lexer keyword →
@@ -198,7 +198,22 @@ read-only donors; the C reference for sundials lives in
   exact, the light end pokes farther (|z1| > |z2| when m2 > m1),
   ball-vs-pole and ball-vs-rod contacts exact
   (`dumbbell_wall_gaps_and_ball_contacts_are_exact`,
-  `dumbbell_constructor_com_sdf_and_supports`).
+  `dumbbell_constructor_com_sdf_and_supports`); dumbbell part masses
+  whose SUM overflows f64 are refused, and a fat-rod dumbbell
+  (rod_radius > both sphere radii) reports honest side-on supports —
+  rank 1 with footprint = the rod half-length, not a sphere point
+  (`fat_rod_dumbbell_reports_honest_support_ranks`); DEF is hardened:
+  parameters cannot be reserved words, builtins, pi/tau or duplicates,
+  defaults are expressions only (a command like `reset` is refused at
+  definition time), a `}` inside a `#` comment does not close the
+  body, `NEW ... AS n` errors when `n` is bound to a number, and a
+  function that runs NEW inside another NEW's initializer
+  stashes/restores the outer NEW context — both objects exist, a
+  failing inner call rolls the outer back
+  (`def_hardening_reserved_words_duplicates_defaults_and_nesting`);
+  and contact records arriving with a notebook system never reach the
+  scene playback copy — cleared at create, refresh-sync and reset
+  (`stale_notebook_contacts_never_reach_the_playback_copy`).
 - Verified UI facts to protect (re-check with a headless-Chrome CDP
   session after touching `scene.html`): arrow keys translate the view
   right/left (and up/down), left-drag orbits yaw+pitch, mouse wheel

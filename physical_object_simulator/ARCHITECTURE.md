@@ -562,6 +562,6 @@ queues an event.
 | wire/kernel | `jupyter/test_protocol.py`, `jupyter/test_kernel.py` | machine protocol incl. the scene command family and the `events` op; full Jupyter ZMQ path |
 | real-browser gestures | scratchpad `verify_gestures.py` (headless Chrome CDP; not committed) | genuine key/mouse/wheel input: arrows translate right/left/up/down, left-drag rotates, wheel and +/- zoom, toolbar Start/Pause/Reverse, statusbar reporting |
 
-Regression invariant: `cargo test --workspace` green (99 tests:
-39 lib + 16 collision + 9 conservation + 35 posim) and
+Regression invariant: `cargo test --workspace` green (103 tests:
+40 lib + 16 collision + 9 conservation + 38 posim) and
 `cargo build --workspace` warning-free at every commit.

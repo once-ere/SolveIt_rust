@@ -174,6 +174,7 @@ impl Shared {
     /// the simulation from the beginning.
     fn reset_playback(&mut self) {
         self.system = self.initial.clone();
+        self.system.contacts.clear(); /* defense in depth */
         self.history.clear();
         self.steps_done = 0;
         self.mode = RunMode::Stopped;
@@ -384,6 +385,10 @@ impl SceneHandle {
 
         let mut camera = Camera::default();
         camera.dist = fit_distance(&system);
+        /* the playback copy starts with NO contact records: frames must
+         * only ever carry contacts the playback itself resolved */
+        let mut system = system;
+        system.contacts.clear();
         let shared = Arc::new(Mutex::new(Shared {
             initial: system.clone(),
             system,
@@ -480,9 +485,10 @@ impl SceneHandle {
     pub fn sync(&self, system: &PhysicalObjectSystem) -> Result<(), String> {
         let mut sh = self.lock()?;
         sh.system = system.clone();
+        sh.system.contacts.clear(); /* only playback-resolved contacts */
         /* the synced state becomes the new "initial values" that the
          * Reset button / SCENE RESET restore */
-        sh.initial = system.clone();
+        sh.initial = sh.system.clone();
         sh.history.clear();
         sh.steps_done = 0;
         sh.needs_init = true;
@@ -688,6 +694,12 @@ impl SceneHandle {
     #[cfg(test)]
     pub fn packed_state(&self) -> Vec<f64> {
         self.lock().map(|sh| sh.system.pack_state()).unwrap_or_default()
+    }
+
+    /// Contact records currently on the playback copy (used in tests).
+    #[cfg(test)]
+    pub fn contacts_len(&self) -> usize {
+        self.lock().map(|sh| sh.system.contacts.len()).unwrap_or(0)
     }
 }
 
@@ -1010,6 +1022,8 @@ mod tests {
         /* collision UI: normal-arrow toggle + statusbar counter */
         assert!(body.contains("id=\"bt-contacts\""), "Contacts toggle missing");
         assert!(body.contains("id=\"bt-reset\""), "permanent Reset button missing");
+        assert!(body.contains("id=\"hud\""), "conserved-quantities HUD missing");
+        assert!(body.contains("conserved quantities"), "HUD label missing");
         assert!(body.contains("id=\"st-contacts\""), "contacts statusbar missing");
         /* the three required gestures are wired in the page script */
         assert!(body.contains("ArrowLeft") && body.contains("ArrowRight"), "arrow keys");
@@ -1154,6 +1168,30 @@ mod tests {
         assert!(seen.contains("\"tube_radius\":0.5"), "{seen}");
         assert!(seen.contains("\"wall\":true"), "{seen}");
         assert!(seen.contains("\"name\":\"ringo\""), "{seen}");
+    }
+
+    #[test]
+    fn stale_notebook_contacts_never_reach_the_playback_copy() {
+        // A system arriving with contact records from a notebook
+        // STEP/RUN must not re-flash arrows in the window: the
+        // playback copy only ever carries contacts IT resolved.
+        let mut sys = test_system();
+        sys.contacts.push(::physical_object::collide::Contact {
+            i: 0,
+            j: 0,
+            t: 1.0,
+            point: Vec3::zeros(),
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            depth: 0.0,
+            rel_vel_n: -1.0,
+            impulse_n: 2.0,
+        });
+        let handle = SceneHandle::start(sys.clone(), 0, false, false).unwrap();
+        assert_eq!(handle.contacts_len(), 0, "cleared at CREATE");
+        handle.sync(&sys).unwrap();
+        assert_eq!(handle.contacts_len(), 0, "cleared at REFRESH sync");
+        handle.reset_playback().unwrap();
+        assert_eq!(handle.contacts_len(), 0, "cleared at RESET");
     }
 
     #[test]

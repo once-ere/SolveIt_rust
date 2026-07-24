@@ -636,7 +636,7 @@ conserve $E$, $P$ AND $L$ (about the origin) to $10^{-8}$ through the real
 CVODE event path}
 (\code{colliding\_dumbbells\_conserve\_energy\_momentum\_and\_angular\_momentum})
 --- the impulse pair acts at one shared contact point, so the net torque is
-zero. Grammar tests (35 posim tests) cover
+zero. Grammar tests (38 posim tests) cover
 the whole command family including error paths, now with the
 \kw{new torus}/\kw{disk}/\kw{cylinder} parameter paths (the
 order-independent inner/outer pair, \kw{height} as the full height,
@@ -665,8 +665,8 @@ playback copy conserved $E$ to $10^{-9}$; the golden contact arrows drew
 (2218 gold pixels counted on the canvas) and the dashed box wireframe drew
 (5904 pixels); reverse playback was exercised. All regression anchors (outer
 solar system, Kepler, gyroradius, tumbling body) still print SUCCESS;
-\textbf{99 tests green} (39 lib + 16 collision + 9 conservation +
-35 posim); the workspace builds with zero warnings; \code{Cargo.lock} still
+\textbf{103 tests green} (40 lib + 16 collision + 9 conservation +
+38 posim); the workspace builds with zero warnings; \code{Cargo.lock} still
 lists only the five local crates.
 
 \section{The twelve examples (run for the USER and the MANAGER)}
@@ -803,11 +803,11 @@ get obj6.inertia_tensor -> [[1.28125, 0, 0], [0, 1.28125, 0], [0, 0, 2.4375]]
 energy -> 30000         momentum -> [100, 200, 100]
 In[15]:= run 0.1 steps 100
 Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10, 119 collision(s) — CONTACTS lists them)
-energy   -> 29999.99999388012
-momentum -> [146.4891109312449, 102.14781200712048, 46.01601279520784]
+energy   -> 29999.999993880127
+momentum -> [146.48911126803657, 102.1478121131382, 46.01601291636828]
 \end{lstlisting}
 \textbf{119 impulses across all three dispatch tiers in 0.1 time units, and
-the energy drift is $|\mathrm dE/E| = 1.031 \cdot 10^{-9}$.} The 51
+the energy drift is $|\mathrm dE/E| = 2.040 \cdot 10^{-10}$.} The 51
 collidable pairs are the 66 pairs of 12 bodies minus the 15 static
 wall--wall pairs; the torus inertia readback matches the analytic tensor
 exactly ($m(\tfrac12 c^2 + \tfrac58 a^2) = 1.28125$,
@@ -914,7 +914,7 @@ denominator $m_i^{-1} + m_j^{-1} + \text{angular terms}$ --- and a wall with
 receives no state writes at all. Newton's third law still acts at every
 contact; the ``missing'' momentum went into the box (Example 11:
 $(100, 200, 100) \to (146.49, 102.15, 46.02)$ while energy is conserved to
-$1.031 \cdot 10^{-9}$ and the walls stay bit-identically at rest).
+$2.040 \cdot 10^{-10}$ and the walls stay bit-identically at rest).
 
 \textbf{Can anything pass through the torus hole?} Balls can.
 Ball-vs-anything uses the exact SDF, and on a line through the hole a small

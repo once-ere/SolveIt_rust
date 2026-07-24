@@ -104,14 +104,64 @@ class PosimKernel(Kernel):
             raise RuntimeError("posim backend exited")
         return reply
 
+    @staticmethod
+    def _brace_delta(line):
+        """Net {/} depth of a line, ignoring braces inside string
+        literals and after # comments — mirrors the posim notebook's
+        continuation logic so a multi-line DEF travels as ONE exec."""
+        depth = 0
+        in_str = False
+        escape = False
+        for c in line:
+            if in_str:
+                if escape:
+                    escape = False
+                elif c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == "#":
+                break
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+        return depth
+
+    @classmethod
+    def _join_cells(cls, code):
+        """Splits a Jupyter cell into posim commands, joining
+        brace-continuation lines (DEF bodies) into single commands."""
+        cells = []
+        pending = ""
+        depth = 0
+        for raw in code.splitlines():
+            line = raw.rstrip()
+            if depth == 0:
+                t = line.strip()
+                if not t or t.startswith("#"):
+                    continue
+                pending = t
+                depth = cls._brace_delta(t)
+            else:
+                depth += cls._brace_delta(line)
+                pending += "\n" + line
+            if depth <= 0:
+                cells.append(pending)
+                pending = ""
+                depth = 0
+        if pending:
+            cells.append(pending)  # unbalanced input: let posim report it
+        return cells
+
     def do_execute(
         self, code, silent, store_history=True, user_expressions=None, allow_stdin=False
     ):
         status = "ok"
-        for line in code.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+        for line in self._join_cells(code):
             try:
                 reply = self._request({"op": "exec", "code": line})
             except Exception as exc:  # backend died

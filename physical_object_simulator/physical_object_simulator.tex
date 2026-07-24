@@ -767,16 +767,16 @@ In[15]:= run 0.1 steps 100
 Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10,
          119 collision(s) --- CONTACTS lists them)
 In[16]:= energy
-Out[16]= 29999.99999388012
+Out[16]= 29999.999993880127
 In[17]:= momentum
-Out[17]= [146.4891109312449, 102.14781200712048, 46.01601279520784]
+Out[17]= [146.48911126803657, 102.1478121131382, 46.01601291636828]
 \end{lstlisting}
 
 \emph{What to notice.} $E_0 = \tfrac12\cdot 1\cdot(100^2 + 200^2 +
 100^2) = \textbf{30000}$ exactly (one mover). In 0.1\,s the box
 produces \textbf{119 collisions} spanning all three dispatch tiers of
 \S\ref{sec:collisions}, and total energy survives every one of them to
-$|\Delta E/E| = 1.031\times10^{-9}$. Momentum does \textbf{not}
+$|\Delta E/E| = 2.040\times10^{-10}$. Momentum does \textbf{not}
 survive --- $(100, 200, 100) \to (146.49, 102.15, 46.02)$ --- and that
 is the \emph{physical signature} of the infinitely massive walls: they
 absorb momentum without moving ($\Delta v = \Delta p\,m^{-1} =

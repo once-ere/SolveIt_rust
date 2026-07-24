@@ -553,13 +553,15 @@ function drawCylinder(ent, pos, b, basis, w, h, focal, color) {
  * the rod's two silhouette lines — one rigid body, spin visible. */
 function drawDumbbell(ent, pos, b, basis, w, h, focal, color) {
   const q = b ? [b[3], b[4], b[5], b[6]] : [1, 0, 0, 0];
-  const centers = [[ent.z1 || -0.5, ent.r1 || 0.25], [ent.z2 || 0.5, ent.r2 || 0.25]];
+  /* ?? not ||: a legitimate 0 / -0.0 offset must not fall back */
+  const z1 = ent.z1 ?? -0.5, z2 = ent.z2 ?? 0.5;
+  const centers = [[z1, ent.r1 ?? 0.25], [z2, ent.r2 ?? 0.25]];
   /* rod silhouette: 4 lines between the sphere centers offset radially */
   ctx.strokeStyle = color; ctx.lineWidth = 1.2;
-  const rodr = ent.rod_radius || 0.1;
+  const rodr = ent.rod_radius ?? 0.1;
   for (const dir of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-    const a = rotateByQuat([dir[0] * rodr, dir[1] * rodr, ent.z1 || -0.5], q);
-    const c = rotateByQuat([dir[0] * rodr, dir[1] * rodr, ent.z2 || 0.5], q);
+    const a = rotateByQuat([dir[0] * rodr, dir[1] * rodr, z1], q);
+    const c = rotateByQuat([dir[0] * rodr, dir[1] * rodr, z2], q);
     const sa = project([pos[0] + a[0], pos[1] + a[1], pos[2] + a[2]], basis, w, h, focal);
     const sc = project([pos[0] + c[0], pos[1] + c[1], pos[2] + c[2]], basis, w, h, focal);
     if (sa && sc) { ctx.beginPath(); ctx.moveTo(sa.x, sa.y); ctx.lineTo(sc.x, sc.y); ctx.stroke(); }

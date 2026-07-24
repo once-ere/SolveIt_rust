@@ -560,8 +560,25 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
             }
             args.reverse();
             if state.functions.contains_key(name) {
-                let ret = call_user_function(name, args, state)?;
-                stack.push(ret);
+                /* a function called from INSIDE a NEW initializer list
+                 * (e.g. `new sphere { mass = f() }`) must not clobber
+                 * the in-progress NEW context: stash it, call, restore
+                 * on BOTH paths so the outer initializers and the
+                 * outer rollback still see their own object */
+                let stash = (
+                    state.last_new.take(),
+                    state.pending_velocity.take(),
+                    state.pending_angular_velocity.take(),
+                    state.pending_torus.take(),
+                    state.pending_dumbbell.take(),
+                );
+                let result = call_user_function(name, args, state);
+                state.last_new = stash.0;
+                state.pending_velocity = stash.1;
+                state.pending_angular_velocity = stash.2;
+                state.pending_torus = stash.3;
+                state.pending_dumbbell = stash.4;
+                stack.push(result?);
             } else {
                 stack.push(call_builtin(name, args)?);
             }
@@ -1082,7 +1099,14 @@ fn resolve_name_arg(state: &SimState, arg: &NameArg) -> Result<String, String> {
             .or_else(|| state.globals.get(id))
         {
             Some(Value::Str(st)) => st.clone(),
-            _ => id.clone(),
+            Some(other) => {
+                return Err(format!(
+                    "`{id}` is bound to a {}, not a string name — pass a string \
+                     (e.g. \"{id}0\") or bind `{id}` to a string",
+                    type_name(other)
+                ))
+            }
+            None => id.clone(),
         },
     };
     let name = raw.to_ascii_lowercase();
@@ -1149,8 +1173,10 @@ fn dumbbell_members(o: &physical_object) -> Option<(f64, f64, f64, f64, f64, f64
 }
 
 /// Rewrites one dumbbell member and rebuilds the body: total mass, COM
-/// offsets and the inertia tensor all follow (the object's position —
-/// its COM — and velocities are untouched).
+/// offsets and the inertia tensor all follow. The object's position
+/// (its COM) and orientation are untouched; MOMENTUM and ANGULAR
+/// MOMENTUM are preserved (the setters are momentum-canonical), so the
+/// velocity and angular velocity rescale with the new mass/inertia.
 fn dumbbell_member_write(
     o: &mut physical_object,
     field: &str,
@@ -1558,10 +1584,51 @@ pub fn define_function(source: &str, state: &mut SimState) -> Result<Value, Stri
     let Some(open) = brace else {
         return Err("DEF needs a `{ body }` block: DEF name(params) { commands }".to_string());
     };
-    let close = source.rfind('}').ok_or_else(|| "DEF: missing the closing `}`".to_string())?;
-    if close < open {
-        return Err("DEF: the closing `}` comes before the opening `{`".to_string());
-    }
+    /* find the brace that CLOSES the block (depth-matched, blind to
+     * braces inside string literals and `#` comments — a `}` in a
+     * trailing comment must not end the body) */
+    let close = {
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut prev_escape = false;
+        let mut in_comment = false;
+        let mut found = None;
+        for (i, c) in source.char_indices() {
+            if i < open {
+                continue;
+            }
+            if in_comment {
+                if c == '\n' {
+                    in_comment = false;
+                }
+                continue;
+            }
+            if in_str {
+                if prev_escape {
+                    prev_escape = false;
+                } else if c == '\\' {
+                    prev_escape = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '#' => in_comment = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        found.ok_or_else(|| "DEF: missing the closing `}` (unbalanced braces)".to_string())?
+    };
     let header = &source[..open];
     let body_text = &source[open + 1..close];
     let trailer = source[close + 1..].trim();
@@ -1614,12 +1681,37 @@ pub fn define_function(source: &str, state: &mut SimState) -> Result<Value, Stri
             if !ok {
                 return Err(format!("DEF {fname}: `{pname}` is not a valid parameter name"));
             }
+            /* a parameter must lex as a plain identifier: a keyword
+             * (NEW, RESET, ...) would silently EXECUTE instead of
+             * reading the argument; the builtins and pi/tau could
+             * never be referenced */
+            let lname = pname.to_ascii_lowercase();
+            match crate::lexer::tokenize(&lname) {
+                Ok(toks)
+                    if toks.len() == 1
+                        && matches!(toks[0].kind, crate::lexer::TokKind::Ident(_)) => {}
+                _ => {
+                    return Err(format!(
+                        "DEF {fname}: `{pname}` is a reserved word and cannot name a \
+                         parameter"
+                    ))
+                }
+            }
+            if BUILTIN_NAMES.contains(&lname.as_str()) || lname == "pi" || lname == "tau" {
+                return Err(format!(
+                    "DEF {fname}: `{pname}` is a builtin and cannot name a parameter"
+                ));
+            }
+            if params.iter().any(|(existing, _)| *existing == lname) {
+                return Err(format!("DEF {fname}: duplicate parameter `{pname}`"));
+            }
             let dval = match default {
                 None => None,
                 Some(d) => {
-                    /* defaults are ordinary expressions, evaluated once
-                     * NOW (LET variables are visible) */
-                    let prog = crate::parser::compile_line(d)
+                    /* defaults are EXPRESSIONS ONLY (a command like
+                     * `reset` here is a definition-time error), and are
+                     * evaluated once NOW (LET variables are visible) */
+                    let prog = crate::parser::compile_expression(d)
                         .map_err(|e| format!("DEF {fname}: default for `{pname}`: {e}"))?;
                     Some(execute(&prog, state).map_err(|e| {
                         format!("DEF {fname}: default for `{pname}`: {e}")
@@ -2665,6 +2757,77 @@ mod tests {
         let e5 = execute_line("bad()", &mut st).unwrap_err();
         assert!(e5.contains("bad()"), "{e5}");
         assert_eq!(st.system.objects.len(), before, "no ghost from a failing function");
+    }
+
+    #[test]
+    fn def_hardening_reserved_words_duplicates_defaults_and_nesting() {
+        let mut st = SimState::default();
+
+        // A function that CREATES an object may be called from inside a
+        // NEW initializer: the outer NEW context is stashed/restored.
+        execute_line("def spawn() { new point { mass = 3 } ; 7 }", &mut st).unwrap();
+        execute_line("new sphere { mass = spawn() }", &mut st).unwrap();
+        assert_eq!(st.system.objects.len(), 2, "outer sphere + inner point");
+        // The outer NEW registers first (obj0), the point spawned
+        // mid-initializer lands after it (obj1).
+        assert_eq!(
+            execute_line("get obj0.mass", &mut st).unwrap(),
+            Value::Num(7.0),
+            "the outer sphere got the function's return value"
+        );
+        assert_eq!(execute_line("get obj1.mass", &mut st).unwrap(), Value::Num(3.0));
+
+        // A FAILING function inside a NEW rolls the outer object back.
+        execute_line("def bad() { new sphere { radius = -1 } }", &mut st).unwrap();
+        let before = st.system.objects.len();
+        assert!(execute_line("new sphere { mass = bad() }", &mut st).is_err());
+        assert_eq!(st.system.objects.len(), before, "no ghosts on either level");
+
+        // Defaults are EXPRESSIONS only: a command is refused at
+        // definition time (and the system is untouched).
+        let e = execute_line("def evil(a = reset) { a }", &mut st).unwrap_err();
+        assert!(e.contains("default for `a`"), "{e}");
+        assert_eq!(st.system.objects.len(), before, "RESET did not run");
+
+        // Reserved words / builtins / pi/tau cannot name parameters.
+        for bad_def in [
+            "def f(new) { new }",
+            "def f(box) { box }",
+            "def f(sqrt) { sqrt }",
+            "def f(pi) { pi }",
+        ] {
+            let e = execute_line(bad_def, &mut st).unwrap_err();
+            assert!(
+                e.contains("reserved word") || e.contains("builtin"),
+                "{bad_def}: {e}"
+            );
+        }
+        // Duplicate parameters are refused (case-insensitively).
+        let e = execute_line("def f(a, A = 1) { a }", &mut st).unwrap_err();
+        assert!(e.contains("duplicate parameter"), "{e}");
+
+        // LET cannot shadow the built-in constants.
+        let e = execute_line("let pi = 3", &mut st).unwrap_err();
+        assert!(e.contains("built-in constant"), "{e}");
+
+        // A `}` inside a trailing # comment does not end the DEF body.
+        execute_line(
+            "def g() {\n  new sphere { mass = 2 } # note: } brace in comment\n}",
+            &mut st,
+        )
+        .unwrap();
+        execute_line("g()", &mut st).unwrap();
+        let n = st.system.objects.len();
+        assert_eq!(
+            execute_line(&format!("get obj{}.mass", n - 1), &mut st).unwrap(),
+            Value::Num(2.0)
+        );
+
+        // AS with a NON-string binding is an error, not a silent
+        // literal name.
+        execute_line("let n = 2", &mut st).unwrap();
+        let e = execute_line("new sphere as n", &mut st).unwrap_err();
+        assert!(e.contains("not a string name"), "{e}");
     }
 
     #[test]

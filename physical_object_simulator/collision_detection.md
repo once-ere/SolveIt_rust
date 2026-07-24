@@ -606,7 +606,7 @@ bodies.
   (`colliding_dumbbells_conserve_energy_momentum_and_angular_momentum`) —
   the impulse pair acts at one shared contact point, so the net torque is
   zero.
-- **Grammar tests** (35 posim tests): the whole command family end-to-end,
+- **Grammar tests** (38 posim tests): the whole command family end-to-end,
   including read-only and range errors and the `system.collisions` vs
   `system.collide` distinction; new: the `NEW TORUS/DISK/CYLINDER` parameter
   paths (the order-independent inner/outer pair, `HEIGHT` as the full
@@ -634,8 +634,8 @@ bodies.
   contact arrows drew (2218 gold pixels counted on the canvas) and the
   dashed box wireframe drew (5904 pixels); reverse playback was exercised.
 - **Regression anchors intact**: outer solar system, Kepler, gyroradius,
-  tumbling body — all still SUCCESS; **99 tests green** (39 lib +
-  16 collision + 9 conservation + 35 posim); the full workspace builds with
+  tumbling body — all still SUCCESS; **103 tests green** (40 lib +
+  16 collision + 9 conservation + 38 posim); the full workspace builds with
   **zero warnings** and `Cargo.lock` still lists only the five local crates.
 
 ---
@@ -827,8 +827,8 @@ In[13]:= energy                   → 30000
 In[14]:= momentum                 → [100, 200, 100]
 In[15]:= run 0.1 steps 100
 Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10, 119 collision(s) — CONTACTS lists them)
-In[16]:= energy                   → 29999.99999388012
-In[17]:= momentum                 → [146.4891109312449, 102.14781200712048, 46.01601279520784]
+In[16]:= energy                   → 29999.999993880127
+In[17]:= momentum                 → [146.48911126803657, 102.1478121131382, 46.01601291636828]
 ```
 
 **119 impulses across all three dispatch tiers in 0.1 time units, and the

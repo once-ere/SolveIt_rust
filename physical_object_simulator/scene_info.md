@@ -599,8 +599,8 @@ workspace suite is now 94 tests: 37 lib + 15 collision +
   errors.
 
 **Reset + conserved-quantities release (2026-07-24).** The workspace
-suite is now **99 tests: 39 lib + 16 collision + 9 conservation +
-35 posim**, zero warnings. What the new layers pin down:
+suite is now **103 tests: 40 lib + 16 collision + 9 conservation +
+38 posim**, zero warnings. What the new layers pin down:
 
 * **Reset is a true re-initialization.** The posim test
   `reset_restores_the_initial_state_and_start_reruns` runs the

@@ -397,7 +397,7 @@ velocity write.
 | `ring_radius`, `tube_radius` | number | RW | tori only; writing recomputes inertia |
 | `inner_radius`, `outer_radius` | number | RW | tori only, derived (inner = c − a, outer = c + a); writing one holds the other fixed; `inner_radius` accepts **≥ 0** (0 = the horn torus; the other radii must be > 0) |
 | `height`, `half_height` | number | RW | cylinders only; `height` is the full height (= 2·`half_height`); writing recomputes inertia |
-| `m1`, `m2`, `m_rod` | number | RW | dumbbells only: the two sphere masses and the rod mass; writing rebuilds the body — total mass, the COM offsets and the inertia tensor all follow (position and velocities are untouched) |
+| `m1`, `m2`, `m_rod` | number | RW | dumbbells only: the two sphere masses and the rod mass; writing rebuilds the body — total mass, the COM offsets and the inertia tensor all follow (position is untouched; the stored momenta are preserved — momentum-canonical, like every mass write — so the velocities rescale with the new mass and inertia) |
 | `r1`, `r2`, `rod_radius` | number | RW | dumbbells only: the sphere radii and the rod radius (alias `rod_r`); same rebuild on write |
 | `length` | number | RW | dumbbells only: distance between the sphere centers (alias `len`); same rebuild on write |
 | `x`, `y`, `z` | number | RW | every object: shorthands for `position.x/.y/.z` |
@@ -1398,11 +1398,11 @@ Out[14]= [100, 200, 100]
 In[15]:= run 0.1 steps 100
 Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10, 119 collision(s) — CONTACTS lists them)
 In[16]:= energy
-Out[16]= 29999.99999388012
+Out[16]= 29999.999993880127
 In[17]:= momentum
-Out[17]= [146.4891109312449, 102.14781200712048, 46.01601279520784]
+Out[17]= [146.48911126803657, 102.1478121131382, 46.01601291636828]
 In[18]:= get system.collisions
-Out[18]= 132
+Out[18]= 119
 In[19]:= get system.box
 Out[19]= 4
 ```
@@ -1416,7 +1416,7 @@ minus the 15 wall–wall pairs (two static bodies can never collide).
 2.4375) — exactly `I_xy = m(½c² + ⅝a²)`, `I_z = m(c² + ¾a²)` for
 c = 1.5, a = 0.5. The energy starts at E₀ = ½·1·|v|² = 30000
 **exactly** and, after **119 collisions** in 0.1 s, is conserved to
-|dE/E| = 1.031×10⁻⁹ — but momentum went from (100, 200, 100) to
+|dE/E| = 2.040×10⁻¹⁰ — but momentum went from (100, 200, 100) to
 (146.49, 102.15, 46.02): **not conserved**, because the infinitely
 massive walls absorb momentum without moving (§5.8) — the physical
 signature of infinite mass. Along the way the point particle can

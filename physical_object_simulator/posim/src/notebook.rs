@@ -111,14 +111,16 @@ impl Notebook {
                     return Some("usage: %save <file>".to_string());
                 }
                 let mut body = String::new();
+                let mut written = 0usize;
                 for c in &self.cells {
                     if c.ok && !c.input.trim_start().starts_with('%') {
                         body.push_str(&c.input);
                         body.push('\n');
+                        written += 1;
                     }
                 }
                 match std::fs::write(&rest, body) {
-                    Ok(()) => Some(format!("saved {} cell(s) to {rest}", self.cells.len())),
+                    Ok(()) => Some(format!("saved {written} cell(s) to {rest}")),
                     Err(e) => Some(format!("%save failed: {e}")),
                 }
             }

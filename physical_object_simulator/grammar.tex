@@ -449,7 +449,7 @@ is a velocity write.
 \code{ring\_radius}, \code{tube\_radius} & number & RW & tori only; write recomputes inertia\\
 \code{inner\_radius}, \code{outer\_radius} & number & RW & tori only, derived ($\mathrm{inner} = c-a$, $\mathrm{outer} = c+a$); writing one holds the other fixed; \code{inner\_radius} accepts $\ge 0$ (0 = the horn torus; the other radii must be $> 0$)\\
 \code{height}, \code{half\_height} & number & RW & cylinders only; \code{height} is the full height ($= 2\cdot$\code{half\_height}); write recomputes inertia\\
-\code{m1}, \code{m2}, \code{m\_rod} & number & RW & dumbbells only: the two sphere masses and the rod mass; writing rebuilds the body --- total mass, the COM offsets and the inertia tensor all follow (position and velocities are untouched)\\
+\code{m1}, \code{m2}, \code{m\_rod} & number & RW & dumbbells only: the two sphere masses and the rod mass; writing rebuilds the body --- total mass, the COM offsets and the inertia tensor all follow (position is untouched; the stored momenta are preserved --- momentum-canonical, like every mass write --- so the velocities rescale with the new mass and inertia)\\
 \code{r1}, \code{r2}, \code{rod\_radius} & number & RW & dumbbells only: the sphere radii and the rod radius (alias \code{rod\_r}); same rebuild on write\\
 \code{length} & number & RW & dumbbells only: distance between the sphere centers (alias \code{len}); same rebuild on write\\
 \code{x}, \code{y}, \code{z} & number & RW & every object: shorthands for \code{position.x/.y/.z}\\
@@ -1347,11 +1347,11 @@ Out[14]= [100, 200, 100]
 In[15]:= run 0.1 steps 100
 Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10, 119 collision(s) — CONTACTS lists them)
 In[16]:= energy
-Out[16]= 29999.99999388012
+Out[16]= 29999.999993880127
 In[17]:= momentum
-Out[17]= [146.4891109312449, 102.14781200712048, 46.01601279520784]
+Out[17]= [146.48911126803657, 102.1478121131382, 46.01601291636828]
 In[18]:= get system.collisions
-Out[18]= 132
+Out[18]= 119
 In[19]:= get system.box
 Out[19]= 4
 \end{lstlisting}
@@ -1367,7 +1367,7 @@ $I_{xy} = m(\tfrac12 c^2 + \tfrac58 a^2)$,
 $I_z = m(c^2 + \tfrac34 a^2)$ for $c = 1.5$, $a = 0.5$. The energy
 starts at $E_0 = \tfrac12\cdot 1\cdot|v|^2 = 30000$ \textbf{exactly}
 and, after \textbf{119 collisions} in 0.1\,s, is conserved to
-$|dE/E| = 1.031\times10^{-9}$ --- but momentum went from
+$|dE/E| = 2.040\times10^{-10}$ --- but momentum went from
 $(100, 200, 100)$ to $(146.49, 102.15, 46.02)$: \textbf{not
 conserved}, because the infinitely massive walls absorb momentum
 without moving --- the physical signature of infinite mass. Along the

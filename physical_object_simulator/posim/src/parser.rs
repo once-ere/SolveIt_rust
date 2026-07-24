@@ -83,6 +83,26 @@ pub struct Parser {
     pos: usize,
 }
 
+/// Compiles exactly ONE expression (never a command form) — the entry
+/// point for DEF parameter defaults, so a default like `reset` or
+/// `del 0` is a definition-time error instead of a command that runs.
+pub fn compile_expression(src: &str) -> Result<Vec<Instr>, String> {
+    let toks = tokenize(src)?;
+    if toks.is_empty() {
+        return Err("expected an expression".to_string());
+    }
+    let mut p = Parser { toks, pos: 0 };
+    let mut prog = Vec::new();
+    p.expr(&mut prog)?;
+    if let Some(t) = p.peek() {
+        return Err(format!(
+            "parse error at column {}: unexpected {} after the expression",
+            t.col, t.kind
+        ));
+    }
+    Ok(prog)
+}
+
 /// Compiles one command line into a stack-machine program.
 pub fn compile_line(line: &str) -> Result<Vec<Instr>, String> {
     let toks = tokenize(line)?;
@@ -363,6 +383,11 @@ impl Parser {
             TokKind::Keyword(Keyword::Let) => {
                 self.pos += 1;
                 let name = self.expect_ident("a variable name")?.to_ascii_lowercase();
+                if name == "pi" || name == "tau" {
+                    return Err(format!(
+                        "`{name}` is a built-in constant and cannot be a LET variable"
+                    ));
+                }
                 self.eat(&TokKind::Equals)?;
                 self.expr(&mut prog)?;
                 prog.push(Instr::StoreGlobal(name));

@@ -97,6 +97,12 @@ pub fn dumbbell(
     pos("rod_radius", rod_radius)?;
     pos("length", length)?;
     let mass = m1 + m2 + m_rod;
+    if !mass.is_finite() {
+        return Err(format!(
+            "dumbbell: total mass m1 + m2 + m_rod overflows f64 (got {mass}); reduce the \
+             part masses"
+        ));
+    }
     let z1 = -(m2 + 0.5 * m_rod) * length / mass;
     let z2 = (m1 + 0.5 * m_rod) * length / mass;
     Ok((
@@ -369,10 +375,29 @@ pub fn support_rank(boundary: &Boundary, u: Vec3) -> u8 {
                 0 // rim point
             }
         }
-        // A sphere end supports at a single point in every generic
-        // direction (side-on the rod could support a line, but a
-        // sphere always ties or beats it at the ends).
-        Boundary::Dumbbell { .. } => 0,
+        Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+            // The winning PART decides: a sphere end is a point
+            // (rank 0); a FAT rod (rod_radius > the sphere radii,
+            // permitted by the constructor) can win side-on with its
+            // side line, or axially with a cap-like annulus — mirror
+            // support_extent's part selection.
+            let s1 = z1 * u.z + r1;
+            let s2 = z2 * u.z + r2;
+            let zc = 0.5 * (z1 + z2);
+            let hh = 0.5 * (z2 - z1);
+            let rod = zc * u.z + rod_radius * s_xy + hh * u.z.abs();
+            if rod > s1.max(s2) {
+                if s_xy < eps {
+                    2 // rod cap wins axially: a face
+                } else if u.z.abs() < eps {
+                    1 // rod side line wins side-on
+                } else {
+                    0 // rod rim point
+                }
+            } else {
+                0 // a sphere end: single point
+            }
+        }
     }
 }
 
@@ -423,7 +448,26 @@ pub fn support_footprint_radius(boundary: &Boundary, u: Vec3) -> f64 {
                 0.0
             }
         }
-        Boundary::Dumbbell { .. } => 0.0, // sphere-end point support
+        Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+            // Mirror support_rank: only a winning fat rod has a flat
+            // supporting set (its side line / cap).
+            let s1 = z1 * u.z + r1;
+            let s2 = z2 * u.z + r2;
+            let zc = 0.5 * (z1 + z2);
+            let hh = 0.5 * (z2 - z1);
+            let rod = zc * u.z + rod_radius * s_xy + hh * u.z.abs();
+            if rod > s1.max(s2) {
+                if s_xy < eps {
+                    *rod_radius // cap
+                } else if u.z.abs() < eps {
+                    hh // side line half-length
+                } else {
+                    0.0
+                }
+            } else {
+                0.0 // sphere-end point support
+            }
+        }
     }
 }
 
@@ -595,6 +639,33 @@ mod tests {
         assert!(dumbbell(0.0, 1.0, 0.1, 0.2, 0.2, 0.1, 1.0).is_err());
         assert!(dumbbell(1.0, 1.0, -0.1, 0.2, 0.2, 0.1, 1.0).is_err());
         assert!(dumbbell(1.0, 1.0, 0.1, 0.2, 0.2, 0.1, 0.0).is_err());
+        // Finite parts whose SUM overflows are refused too (the COM
+        // geometry would silently collapse otherwise).
+        let e = dumbbell(1e308, 1e308, 0.0, 0.25, 0.25, 0.1, 1.0).unwrap_err();
+        assert!(e.contains("overflows"), "{e}");
+    }
+
+    #[test]
+    fn fat_rod_dumbbell_reports_honest_support_ranks() {
+        // rod_radius > both sphere radii is constructible: side-on the
+        // ROD wins the support with its side LINE (rank 1, footprint =
+        // the rod half-length), not a sphere point.
+        let (_, b) = dumbbell(1.0, 1.0, 1.0, 0.1, 0.12, 0.5, 2.0).unwrap();
+        let ex = Vec3::new(1.0, 0.0, 0.0);
+        let hh = match b {
+            Boundary::Dumbbell { z1, z2, .. } => 0.5 * (z2 - z1),
+            _ => unreachable!(),
+        };
+        assert_eq!(support_rank(&b, ex), 1, "fat rod side line");
+        assert!((support_footprint_radius(&b, ex) - hh).abs() < 1e-12);
+        // Axially a sphere pole always wins: single point.
+        let ez = Vec3::new(0.0, 0.0, 1.0);
+        assert_eq!(support_rank(&b, ez), 0);
+        assert_eq!(support_footprint_radius(&b, ez), 0.0);
+        // A normal thin-rod dumbbell stays rank 0 everywhere generic.
+        let (_, thin) = dumbbell(1.0, 2.0, 0.5, 0.25, 0.25, 0.1, 1.0).unwrap();
+        assert_eq!(support_rank(&thin, ex), 0);
+        assert_eq!(support_footprint_radius(&thin, ex), 0.0);
     }
 
     #[test]
