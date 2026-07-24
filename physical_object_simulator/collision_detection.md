@@ -16,7 +16,7 @@ This document is written for a reader with **zero prior knowledge**. It contains
 6. the full technical documentation of the posim implementation — including the
    **precise contact normal** (the action–reaction line) and how it is exposed to
    every other simulation entity, and
-7. **eleven non-trivial worked examples**, fully documented, with their real
+7. **twelve non-trivial worked examples**, fully documented, with their real
    captured output.
 
 ---
@@ -236,8 +236,10 @@ types have exact constant-time formulas with exact normals. Bullet itself
 special-cases exactly these pairs for the same reason. If a general convex hull
 shape is ever added, GJK+EPA (or parry) becomes the right tool; the `Contact`
 record and solver do not change. *(The shape set has since grown — torus, disk,
-cylinder — and remains closed: §6's three-tier dispatch keeps every ball
-contact and every face contact exact, still without GJK.)*
+cylinder, and now the compound dumbbell — and remains closed: §6's three-tier
+dispatch keeps every ball contact and every face contact exact, still without
+GJK; the dumbbell never even reaches the dispatch whole — it decomposes into
+ball and cylinder parts first.)*
 
 ---
 
@@ -287,25 +289,45 @@ extents/points/ranks, analytic inertia); `physical_object/src/collide.rs`
 `posim` (`COLLIDE`, `CONTACTS`, `BOX`, `contactK` paths); scene arrows + shape
 wireframes in `posim/src/scene/`.
 
-**The shape set.** Six boundaries: `Point`, `Sphere`, `Cuboid`, and — since
-this release — `Torus { ring_radius, tube_radius }` (a centerline circle of
-radius `c` in the local xy-plane swept by a tube of radius `a`; inner radius
-= `c − a`, outer radius = `c + a`), `Disk { radius }` (an **ideal
-zero-thickness** solid disk in the local xy-plane), and
-`Cylinder { radius, half_height }` (full height = 2 × half-height). Each new
-shape carries an **exact SDF** (torus: distance to the centerline circle
-minus the tube radius; disk: the unsigned distance, zero exactly on the disk
-— a zero-thickness body has no interior; cylinder: the 2-D box SDF in
-(ρ, z)) and the **analytic inertia tensor**: torus `I_z = m(c² + ¾a²)`,
+**The shape set.** Seven boundaries: `Point`, `Sphere`, `Cuboid`, the
+shapes-and-box release's `Torus { ring_radius, tube_radius }` (a centerline
+circle of radius `c` in the local xy-plane swept by a tube of radius `a`;
+inner radius = `c − a`, outer radius = `c + a`), `Disk { radius }` (an
+**ideal zero-thickness** solid disk in the local xy-plane) and
+`Cylinder { radius, half_height }` (full height = 2 × half-height), and —
+since this release — the first **compound** shape,
+`Dumbbell { r1, r2, rod_radius, z1, z2, f1, f2 }`: solid sphere 1 (radius
+`r1`, mass fraction `f1`) centered at `(0, 0, z1)`, solid sphere 2 (`r2`,
+`f2`) at `(0, 0, z2)`, joined by a solid rod of radius `rod_radius` — two
+spheres plus a rod as **one** rigid body. The
+`boundary::dumbbell(m1, m2, m_rod, r1, r2, rod_radius, length)` constructor
+computes the offsets from the part masses — `z1 = −(m2 + m_rod/2)·L/M`,
+`z2 = (m1 + m_rod/2)·L/M` (`L` the center-to-center length,
+`M = m1 + m2 + m_rod`) — so the local origin **is** the center of mass: the
+identity `m1·z1 + m2·z2 + m_rod·(z1 + z2)/2 = 0` holds exactly (pinned by
+test), and the stored fractions `f1`/`f2` keep every part mass recoverable
+from the total. Each non-legacy shape carries an **exact SDF** (torus:
+distance to the centerline circle minus the tube radius; disk: the unsigned
+distance, zero exactly on the disk — a zero-thickness body has no interior;
+cylinder: the 2-D box SDF in (ρ, z); dumbbell: the exact **union** — the
+min of its parts' SDFs, two spheres and the rod's capped cylinder) and the
+**analytic inertia tensor**: torus `I_z = m(c² + ¾a²)`,
 `I_x = I_y = m(½c² + ⅝a²)`; disk `I_x = I_y = ¼ma²`, `I_z = ½ma²`
 (perpendicular-axis theorem); cylinder `I_z = ½mr²`,
-`I_x = I_y = m(3r² + 4h²)/12` (h = half-height). Every shape also provides
-its **support extent** `h(u)` in exact closed form (for the torus this is
-the support of its convex hull — a support function cannot see the hole), a
-**support point** achieving it — the **centroid of the supporting set** when
-that set is a face, edge, circle or cap, so a flat-on contact carries no
-spurious lever arm — and a **support rank** (0 = single point/rim point,
-1 = edge or circle, 2 = face or cap).
+`I_x = I_y = m(3r² + 4h²)/12` (h = half-height); dumbbell the exact
+**composite** — `2/5·m·r²` for each sphere plus its parallel-axis term
+`m·z²`, plus the rod's cylinder terms about the COM (hand-checked). Every
+shape also provides its **support extent** in exact closed form — since
+this release the **true directed** support `h(u) = max x·u`: the dumbbell
+is the first non-centrally-symmetric shape (its off-center spheres make
+`h(u) ≠ h(−u)`), and every symmetric shape's closed form is bit-identically
+unchanged (for them `h(−u) = h(u)`); `world_aabb` now takes the ± directed
+extents per axis, and for the torus the support is that of its convex hull
+— a support function cannot see the hole. Each shape also answers a
+**support point** achieving the extent — the **centroid of the supporting
+set** when that set is a face, edge, circle or cap, so a flat-on contact
+carries no spurious lever arm — and a **support rank** (0 = single
+point/rim point, 1 = edge or circle, 2 = face or cap).
 
 **The Contact record** (pinned convention, ARCHITECTURE.md §3.8):
 
@@ -346,8 +368,13 @@ tiers (still no GJK/EPA/MPR machinery):
    deepest support vertex (face case) or closest points of the supporting
    edges (edge case).
 3. **Support-axis tier** — every remaining extended-vs-extended pair (any
-   pair involving a torus/disk/cylinder not covered above). The SAT gap
-   `|d·l| − (h_a(l) + h_b(l))` is evaluated over a finite candidate-axis
+   pair involving a torus/disk/cylinder not covered above; a dumbbell is
+   decomposed first — see below — so only its rod, as a free cylinder,
+   can arrive here). The **directed** SAT gap `d·l − h_a(l) − h_b(−l)` is
+   evaluated for **both orientations** of every candidate axis — for
+   centrally symmetric shapes `h(−u) = h(u)` and it reduces exactly to
+   the classic `|d·l| − (e_a + e_b)`; the dumbbell's off-center spheres
+   need the general form — over a finite candidate-axis
    list: each cuboid's three **face axes**, each round shape's **symmetry
    axis**, every normalized **cross product** of those primary axes
    (edge-vs-edge and edge-vs-rim separations; near-parallel pairs skipped as
@@ -382,6 +409,22 @@ tiers (still no GJK/EPA/MPR machinery):
    **cap center**, not halfway toward the face centroid (test
    `small_cap_on_large_face_contacts_at_the_cap_center`); comparable
    footprints use the midpoint of the two support-set centroids.
+
+**Compound decomposition (the dumbbell).** A dumbbell never reaches a
+dispatch tier as a whole: the narrow phase **decomposes dumbbell-vs-anything
+over its parts**. Each sphere part is a ball served by the exact ball tier —
+the partner shape's exact SDF evaluated at the sphere center — which is
+exact against **every** shape, *including another dumbbell*, whose union
+SDF is itself exact. The rod recurses as a free-standing cylinder, served
+with a cylinder's usual exactness profile (exact face-on and parallel
+side-side, conservative only on skew corners); contact selection takes the
+deepest part (the `ball_vs_shape_contact` consolidator plus the pose-level
+`contact_geometry_at`). So in dumbbell-vs-dumbbell every part pair that
+involves a sphere is exact, and only **rod-vs-rod** ever reaches the
+approximate support-axis tier. This part-wise exactness is what the
+conservation anchor rests on (§8, Example 12): the impulse pair acts at one
+shared contact point, so two tumbling dumbbells colliding off-center
+conserve E, P **and** L through real CVODE events.
 
 **The rigid box (`BOX <size>`).** Six static `Cuboid` wall slabs enclosing an
 axis-aligned cube of the given inner side length, each with
@@ -458,6 +501,9 @@ combine = min(e_i, e_j); `restitution_threshold` 1e-3; `contact_slop` 1e-9;
 | `NEW DISK { … }` | new **ideal zero-thickness** solid disk: `radius` (default 1) |
 | `NEW CYLINDER { … }` | new cylinder: `radius` (default 0.5); `height` sets the **full** height (default half_height 1) |
 | `NEW CUBE …` / `NEW DISC …` | aliases for `CUBOID` / `DISK` |
+| `NEW DUMBBELL [AS <name>] { … }` | new rigid two-spheres-plus-rod body: `m1`, `m2`, `m_rod`, `r1`, `r2`, `rod_radius`, `length` (defaults 1, 1, 0.5, 0.25, 0.25, 0.1, 1) plus the ordinary entity values — deferred and order-independent, validated once at the closing brace via `boundary::dumbbell` (a failed `NEW` leaves no ghost); the local origin is placed at the COM; `DUMBELL` is an accepted alias spelling; `AS <name>` registers a user name usable in every path (`d.mass`, `d.vx`) |
+| `GET/SET objN.m1` / `.m2` / `.m_rod` | the dumbbell part masses, read **and** write — the stored mass fractions make every part recoverable, and a member write rebuilds total mass, COM offsets and the inertia tensor in one step |
+| `GET/SET objN.r1` / `.r2` / `.rod_radius` / `.length` | the dumbbell geometry (`rod_r`/`len` accepted), read **and** write — same one-step rebuild |
 | `BOX <size>` / `BOX OFF` / `BOX` | create / remove / report the rigid bounding box: six static wall slabs with `inverse_mass = 0` (infinitely massive) |
 | `GET/SET objN.ring_radius`, `.tube_radius` | the torus generating radii (writes recompute inertia) |
 | `GET/SET objN.inner_radius`, `.outer_radius` | the derived torus pair (each write holds the other one fixed) |
@@ -506,7 +552,7 @@ bodies.
 
 ## 8. How it was verified
 
-- **37 unit tests** in `physical_object` (geometry: known separations, SAT face
+- **39 unit tests** in `physical_object` (geometry: known separations, SAT face
   vs. edge, continuity across touch; response: `n·Kn = 1/m₁+1/m₂` for central
   hits, static-wall reflection with the wall bit-unchanged, separating pairs
   untouched, projection separating deep overlap). New this release: the
@@ -527,8 +573,17 @@ bodies.
   — separation = |dz| exactly, touching zero without a sign change) and the
   **smaller-footprint contact rule**
   (`small_cap_on_large_face_contacts_at_the_cap_center` — a 0.25-radius cap
-  pressed into a big slab face contacts at the cap center).
-- **15 integration tests** (`tests/collision.rs`), each against a closed form:
+  pressed into a big slab face contacts at the cap center). New in the
+  dumbbell release: `dumbbell_constructor_com_sdf_and_supports` — the
+  constructor's COM placement (`m1·z1 + m2·z2 + m_rod·(z1+z2)/2 = 0`
+  exactly), the union SDF at hand-checked points, the composite inertia,
+  and the **directed** supports (`h(u) ≠ h(−u)` for the off-center
+  spheres; every symmetric shape's extents unchanged) — and
+  `dumbbell_wall_gaps_and_ball_contacts_are_exact` — an **asymmetric**
+  dumbbell's wall gaps exact at **both** ends (the light end pokes
+  farther: `|z1| > |z2|` when `m2 > m1`), plus ball-vs-pole and
+  ball-vs-rod contacts exact.
+- **16 integration tests** (`tests/collision.rs`), each against a closed form:
   velocity exchange with **TOI error < 1e-9**, unequal-mass formulas, restitution
   ratios and plastic KE loss ½μv², oblique normals = line of centers, off-center
   ΔL = r×J with total L conserved, 3-sphere cradle, bounce apex = e²h with impact
@@ -545,8 +600,13 @@ bodies.
   gravity, caught at the analytic free-fall TOI = √(2·4.985/10) to 1e-6
   (`ball_released_from_rest_does_not_tunnel_the_thin_plate` — the
   acceleration-aware anti-tunneling cap at work: the instantaneous relative
-  speed is zero at arm time).
-- **Grammar tests** (33 posim tests): the whole command family end-to-end,
+  speed is zero at arm time). New in the dumbbell release, the headline
+  anchor: **two tumbling dumbbells colliding off-center conserve E, P AND
+  L (about the origin) to 1e-8 through the real CVODE event path**
+  (`colliding_dumbbells_conserve_energy_momentum_and_angular_momentum`) —
+  the impulse pair acts at one shared contact point, so the net torque is
+  zero.
+- **Grammar tests** (35 posim tests): the whole command family end-to-end,
   including read-only and range errors and the `system.collisions` vs
   `system.collide` distinction; new: the `NEW TORUS/DISK/CYLINDER` parameter
   paths (the order-independent inner/outer pair, `HEIGHT` as the full
@@ -560,7 +620,11 @@ bodies.
   torus, and a failed `NEW` leaving **no ghost object** behind) and
   `box_recreate_after_wall_deletion_leaks_nothing` (bare `BOX` reports the
   dissolved state; `BOX <size>` after a wall deletion removes the surviving
-  tracked slabs first).
+  tracked slabs first). New in the dumbbell release:
+  `def_call_named_objects_and_dumbbell_members` — the full `create_dumbell`
+  flow (define / call / member reads and writes / shorthands / renumber /
+  errors / redefine) — and the scene test
+  `reset_restores_the_initial_state_and_start_reruns`.
 - **Scene**: server frame carries the exact analytic `normal/point/impulse`
   (verified live over a real WebSocket); the golden arrow's pixels verified on
   the canvas; reverse-through-collision replays to exactly t = 0. For this
@@ -570,15 +634,15 @@ bodies.
   contact arrows drew (2218 gold pixels counted on the canvas) and the
   dashed box wireframe drew (5904 pixels); reverse playback was exercised.
 - **Regression anchors intact**: outer solar system, Kepler, gyroradius,
-  tumbling body — all still SUCCESS; **94 tests green** (37 lib +
-  15 collision + 9 conservation + 33 posim); the full workspace builds with
+  tumbling body — all still SUCCESS; **99 tests green** (39 lib +
+  16 collision + 9 conservation + 35 posim); the full workspace builds with
   **zero warnings** and `Cargo.lock` still lists only the five local crates.
 
 ---
 
-## 9. The eleven examples (run for the USER and the MANAGER)
+## 9. The twelve examples (run for the USER and the MANAGER)
 
-All eleven live in `scripts/collisions/` and run with
+All twelve live in `scripts/collisions/` and run with
 `cargo run -p posim -- --script scripts/collisions/NN_name.posim`
 (outputs below are the real captured runs). Two additional self-checking Rust
 examples (`newtons_cradle`, `bouncing_ball_restitution`) print SUCCESS/FAILURE
@@ -780,6 +844,82 @@ formulation), and after 119 collisions the six walls are **bit-identically
 at rest**. Momentum non-conservation with exact energy conservation is the
 physical signature of a rigid container — not a bug.
 
+### Example 12 — `12_two_dumbbells.posim`: two dumbbells from a user-defined function — E, P **and** L conserved
+
+`create_dumbell` is defined **in the notebook language** (`DEF`): it takes a
+name plus every entity value — all with defaults — and builds a named rigid
+dumbbell (two solid spheres joined by a solid rod, one rigid body whose
+local origin is its center of mass). Called twice, it makes `dumbell0`
+(sphere masses 1 + 2, rod 0.5) and `dumbell1` (2 + 1 + 0.4, different radii
+and length); they approach off-center with spin and collide **twice**
+(G = 0, restitution 1, no walls). The full captured run:
+
+```
+In[1]:= set system.g_constant = 0
+In[2]:= def create_dumbell(name, m1 = 1, m2 = 1, m_rod = 0.5, r1 = 0.25, r2 = 0.25, rod_radius = 0.1, length = 1, position = [0, 0, 0], velocity = [0, 0, 0], angular_velocity = [0, 0, 0]) {
+  new dumbbell as name { m1 = m1, m2 = m2, m_rod = m_rod, r1 = r1, r2 = r2, rod_radius = rod_radius, length = length, position = position, velocity = velocity, angular_velocity = angular_velocity }
+}
+Out[2]= function create_dumbell(11 parameter(s)) defined — 1 body line(s)
+In[3]:= create_dumbell("dumbell0", 1, 2, 0.5, 0.25, 0.25, 0.1, 1, [-2, 0.15, 0], [1.5, 0, 0], [0, 0, 0.6])
+Out[3]= obj0 as dumbell0
+In[4]:= create_dumbell("dumbell1", 2, 1, 0.4, 0.3, 0.2, 0.08, 1.2, [2, -0.15, 0], [-1.5, 0, 0], [0.4, 0, 0])
+Out[4]= obj1 as dumbell1
+In[5]:= list
+Out[5]= obj0: dumbbell r1=0.25 r2=0.25 rod_r=0.1 len=1, mass=3.5, charge=0, pos=[-2, 0.15, 0]
+obj1: dumbbell r1=0.3 r2=0.2 rod_r=0.08 len=1.2, mass=3.4, charge=0, pos=[2, -0.15, 0]
+In[6]:= get dumbell0.m1
+Out[6]= 1
+In[7]:= get dumbell1.m_rod
+Out[7]= 0.3999999999999999
+In[8]:= get dumbell0.vx
+Out[8]= 1.5
+In[9]:= energy
+Out[9]= 7.865310611764706
+In[10]:= momentum
+Out[10]= [0.15000000000000036, 0, 0]
+In[11]:= angmom
+Out[11]= [0.4443030588235295, 0, -1.5059999999999998]
+In[12]:= run 3 steps 60
+Out[12]= t = 3 (3861 solver steps, 60 snapshots, |dE/E| = 9.463e-11, 2 collision(s) — CONTACTS lists them)
+In[13]:= energy
+Out[13]= 7.865310611020375
+In[14]:= momentum
+Out[14]= [0.15000000000000036, 0, 0]
+In[15]:= angmom
+Out[15]= [0.44430305882373156, -0.000000000000009547918011776346, -1.505999999999855]
+In[16]:= get system.collisions
+Out[16]= 2
+```
+
+The named member paths are at work in `In[6..8]` — `dumbell1.m_rod` reads
+back `0.3999999999999999` because the part masses are *recovered* from the
+stored mass fractions (`m_rod = (1 − f1 − f2)·M`), honest floating point.
+Through the two collisions:
+
+- **Energy**: `7.865310611764706 → 7.865310611020375` — the run line
+  itself prints `|dE/E| = 9.463e-11`.
+- **Momentum**: `[0.15000000000000036, 0, 0]` — **bit-identical**.
+- **Angular momentum about the origin**:
+  `[0.4443030588235295, 0, -1.5059999999999998]` →
+  `[0.44430305882373156, -9.5e-15, -1.505999999999855]` — drift at the
+  1e-13 level.
+
+**Why is L conserved here when Example 11 lost momentum?** Nothing in this
+scene is static, and each impulse pair `±J n̂` acts at **one shared contact
+point**: the two angular impulses about any fixed origin are
+`x_c × (+J n̂)` and `x_c × (−J n̂)` — they cancel exactly. Action–reaction
+at a single point produces **zero net torque**, and with G = 0 there is no
+other torque source, so total L must survive — and it does, through real
+CVODE events, entirely from the part-decomposed contact geometry of §6
+(this is the anchor test
+`colliding_dumbbells_conserve_energy_momentum_and_angular_momentum`,
+which pins E, P and L to 1e-8). Verified live in a real browser as well:
+the entity labels show the user names `dumbell0`/`dumbell1`, and the
+window's labeled conserved-quantities readout displayed
+`E = 7.86531061, P = [0.15000, 0.00000, 0.00000] |.| = 0.15000, L =
+[0.44430, 0.00000, -1.50600] |.| = 1.57017` identically before and after
+the impact (after it, L's y component read `-1.31228e-13`).
+
 ---
 
 ## 10. FAQ
@@ -837,6 +977,17 @@ exactly as invisible as the point-through-disk case (pinned by test
 `parallel_disk_disk_separation_is_the_documented_limitation`). Workaround:
 tilt one disk (a tilted disk has finite extent along the other's normal,
 so the separation genuinely crosses zero) or model a thin cylinder.
+
+**How do compound bodies collide?** The dumbbell — the one compound shape —
+is **decomposed over its parts** by the narrow phase: each sphere part is a
+ball tested through the other shape's exact SDF (exact against everything,
+*including another dumbbell*, whose union SDF is exact), the rod recurses
+as a free-standing cylinder, and the deepest part supplies the contact.
+Only rod-vs-rod ever reaches the approximate support-axis tier. The parts
+are geometry only — dynamically the dumbbell stays **one** rigid body (one
+momentum, one angular momentum, one composite inertia tensor about its
+COM-origin), which is why two tumbling dumbbells conserve E, P and L
+through real events (Example 12).
 
 **Where does friction stand?** Designed (per-object μ, tangential impulse
 clamped to the Coulomb cone, two-direction upgrade documented) but deliberately

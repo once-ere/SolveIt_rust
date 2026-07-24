@@ -78,6 +78,7 @@ whitespace. Everything from a \code{\#} to the end of the line is a
 \textbf{token} & \textbf{examples} & \textbf{rules}\\\hline
 keyword & \code{NEW}, \code{set}, \code{Run} & case-insensitive; list in \S\ref{sec:keywords}\\
 identifier & \code{obj0}, \code{position} & a letter or \code{\_}, then letters, digits, \code{\_}\\
+string & \code{"ball"}, \code{"dumbell0"} & double-quoted, with the escapes \code{\textbackslash"} \code{\textbackslash\textbackslash} \code{\textbackslash n}; strings name objects (\kw{new} \ldots{} \kw{as}, \S\ref{sec:new}) and are passed to user functions (\S\ref{sec:userdefs})\\
 number & \code{2}, \code{0.5}, \code{.5}, \code{1e-3} & 64-bit float; scientific notation allowed; a leading \code{-} is \emph{not} part of the number --- it is the negation operator\\
 punctuation & \code{[ ] \{ \} ( ) , . =} & brackets build vectors, braces enclose initializers, \code{.} builds dotted paths\\
 operators & \code{+ - * /} & ordinary arithmetic\\
@@ -107,11 +108,20 @@ and, for rigid-body collisions (\S\ref{sec:collide}):
 
 \code{COLLIDE CONTACTS ON OFF}
 
+and, for named objects, session variables and user functions
+(\S\ref{sec:new}, \S\ref{sec:userdefs}):
+
+\code{AS LET FUNCS DUMBBELL}
+
 (\kw{destroy} is an alias for \kw{close}; \kw{settimestep} for
 \kw{set\_time\_step}; the spellings \kw{cube} and \kw{disc} are lexer
-aliases for \kw{cuboid} and \kw{disk}. \code{collisions} is
-deliberately \textbf{not} a keyword so the field path
-\code{system.collisions} keeps its own spelling.)
+aliases for \kw{cuboid} and \kw{disk}; \kw{functions} for \kw{funcs};
+and the single-b spelling \kw{dumbell} for \kw{dumbbell}.
+\code{collisions} is deliberately \textbf{not} a keyword so the field
+path \code{system.collisions} keeps its own spelling. \kw{def} is not
+a keyword either: a line starting \code{DEF } is a \textbf{line form}
+recognized before the ordinary grammar --- see \S3 and
+\S\ref{sec:userdefs}.)
 
 Keywords are reserved \emph{at the start of paths}, but \textbf{field
 names may reuse keyword spellings} --- \code{obj0.momentum} and
@@ -137,60 +147,74 @@ alternatives):
 \begin{lstlisting}
 line     := command | magic ;
 
-command  := "NEW" shape [ "{" init { "," init } "}" ]
+command  := "NEW" shape [ "AS" (IDENT | STRING) ]
+                         [ "{" init { "," init } "}" ]
+                                              (* AS registers a user
+                                                 name for the object *)
           | "SET" path "=" expr
           | "GET" path
           | "DEL" NUMBER
           | "LIST"
-          | "STEP" expr                        (* advance time by dt      *)
-          | "RUN" expr [ "STEPS" NUMBER ]      (* advance by t, n outputs *)
+          | "STEP" expr                       (* advance by dt      *)
+          | "RUN" expr [ "STEPS" NUMBER ]     (* advance by t, n outs *)
           | "METHOD" ( "ADAMS" | "BDF" | "SPRK" IDENT [ NUMBER ] )
           | "ENERGY" | "COM" | "MOMENTUM" | "ANGMOM"
           | "LAPLACE" NUMBER
-          | "RESET"
-          | "HELP"
-          | "SCENE" scenecmd                   (* graphical scene window  *)
-          | "COLLIDE" [ "ON" | "OFF" ]         (* bare: report status     *)
-          | "CONTACTS"                         (* contacts of last run    *)
-          | "BOX" [ "OFF" | expr ]             (* rigid bounding box:
-                                                  expr = inner side
-                                                  length; bare = status;
-                                                  OFF removes it          *)
-          | expr ;                             (* bare expression         *)
-
-scenecmd := "CREATE" [ NUMBER ]                (* open window [TCP port]  *)
-          | "CLOSE"                            (* alias: DESTROY          *)
-          | "TRANSLATE" term term [ term ]     (* camera dx dy [dz]       *)
-          | "ROTATE" term term                 (* camera dyaw dpitch, deg *)
-          | "ZOOM" ( "IN" | "OUT" | term )     (* factor > 1 zooms in     *)
-          | "HIDE" [ NUMBER | "ALL" ]          (* default: ALL            *)
+          | "RESET" | "HELP"
+          | "SCENE" scenecmd                  (* graphical scene     *)
+          | "COLLIDE" [ "ON" | "OFF" ]        (* bare: report status *)
+          | "CONTACTS"                        (* list last contacts  *)
+          | "LET" IDENT "=" expr              (* session variable    *)
+          | "FUNCS"                           (* list user functions *)
+          | "SHOW" IDENT                      (* print a function    *)
+          | "BOX" [ "OFF" | expr ]            (* rigid bounding box:
+                                                 expr = inner side
+                                                 length; bare = status;
+                                                 OFF removes it      *)
+          | expr ;                            (* bare expression     *)
+scenecmd := "CREATE" [ NUMBER ]               (* open window [port]  *)
+          | "CLOSE"                           (* aka DESTROY         *)
+          | "TRANSLATE" term term [ term ]    (* camera dx dy [dz]   *)
+          | "ROTATE" term term                (* camera dyaw dpitch  *)
+          | "ZOOM" ( "IN" | "OUT" | term )    (* factor > 1 zooms in *)
+          | "HIDE" [ NUMBER | "ALL" ]         (* default: ALL        *)
           | "SHOW" [ NUMBER | "ALL" ]
-          | "REFRESH"                          (* re-sync from notebook   *)
-          | "REDRAW"                           (* re-send whole scene     *)
+          | "REFRESH"                         (* re-sync from state  *)
+          | "REDRAW"                          (* re-send full scene  *)
           | "START" | "STOP" | "PAUSE" | "REVERSE"
-          | "SET_TIME_STEP" term
+          | "RESET"                           (* re-initialize: all
+                                                 values and the time
+                                                 return to initial;
+                                                 START re-starts    *)
+          | "SET_TIME_STEP" term              (* args are term-level:
+                                                 -5 is negative five;
+                                                 parenthesize sums  *)
           | "STATUS" | "EVENTS" ;
+shape    := "POINT" | "SPHERE" | "CUBOID" | "TORUS" | "DISK" | "CYLINDER"
+          | "DUMBBELL" ;                      (* two solid spheres +
+                                                 a rigid rod, one
+                                                 rigid body          *)
 
-shape    := "POINT" | "SPHERE" | "CUBOID" | "TORUS" | "DISK" | "CYLINDER" ;
-init     := FIELD "=" expr ;
-
-path     := root "." FIELD [ "." COMPONENT ] ;
-root     := "objN"           (* N = object index, e.g. obj0, obj12 *)
-          | "contactK"       (* K = contact index of the last run  *)
-          | "system" | "sys" ;
-COMPONENT:= "x" | "y" | "z" | "w" ;
-
-expr     := term  { ("+" | "-") term  } ;
+(* User-defined functions are a LINE FORM handled before this
+   grammar: DEF name(param [= default], ...) { body } — the body is
+   newline/;-separated commands using the parameters as variables;
+   each body line must itself satisfy this grammar. Invocation uses
+   the ordinary call syntax name(arg, ...); trailing parameters
+   take their defaults. *)
+init     := IDENT "=" expr ;
+path     := IDENT { "." IDENT } ;             (* objN.field[.x|y|z|w],
+                                                 system.field,
+                                                 contactK.field,
+                                                 name.field for
+                                                 AS-registered names *)
+expr     := term { ("+" | "-") term } ;
 term     := unary { ("*" | "/") unary } ;
 unary    := "-" unary | atom ;
-atom     := NUMBER
-          | "[" expr { "," expr } "]"          (* vector/matrix literal  *)
-          | "(" expr ")"
-          | FUNC "(" [ expr { "," expr } ] ")" (* builtin function call  *)
+atom     := NUMBER | STRING | "[" expr { "," expr } "]" | "(" expr ")"
+          | IDENT "(" [ expr { "," expr } ] ")"   (* builtin or user
+                                                     function call   *)
           | path
-          | "pi" | "tau" ;
-FUNC     := "dot" | "cross" | "norm" | "normalize"
-          | "sqrt" | "abs" | "sin" | "cos" | "exp" | "log" ;
+          | IDENT ;                           (* parameter / LET var *)
 \end{lstlisting}
 
 Operator precedence is the usual one: \code{*} and \code{/} bind tighter
@@ -220,6 +244,19 @@ scene zoom (1 + 0.5)           # a sum needs parentheses
 scene translate 2*2 0 1/2      # * and / are fine unparenthesized
 \end{lstlisting}
 
+\textbf{A third subtlety --- bare identifiers compile and resolve at
+execution.} An \code{IDENT} alone is an ordinary atom: the constants
+\code{pi} and \code{tau}, a function parameter, or a \kw{let}
+variable (\S\ref{sec:userdefs}). The name is looked up when the line
+\emph{runs}, not when it parses, so a function body may use
+parameters freely; a name that is bound to nothing fails at execution
+with an error that lists the three ways to bind one (\kw{let}, a
+parameter, or a registered object's \code{name.field} path). A call
+\code{IDENT(...)} is a builtin (\code{dot}, \code{cross},
+\code{norm}, \code{normalize}, \code{sqrt}, \code{abs}, \code{sin},
+\code{cos}, \code{exp}, \code{log}) when the name matches one, and a
+user-defined function otherwise.
+
 \section{The type system (what values exist)}
 
 Every expression evaluates to one of these \emph{values}:
@@ -231,7 +268,7 @@ number & \code{2}, \code{-0.5}, \code{1e-3} & 64-bit float\\
 vec3 & \code{[1, 2, 3]} & exactly 3 numeric entries\\
 quaternion & \code{[w, x, y, z]} & exactly 4 numeric entries, \textbf{w first}; assigned to \code{orientation} it is renormalized to unit length\\
 mat3 & \code{[[a,b,c],[d,e,f],[g,h,i]]} & 3 rows of 3 numbers\\
-string & (produced, not typed) & results like \code{obj0} or run summaries\\
+string & \code{"ball"} & a double-quoted literal (\S2.1) --- names objects (\kw{new} \ldots{} \kw{as}) and feeds user functions; also produced as results like \code{obj0} or run summaries\\
 \end{tabular}
 \end{center}
 
@@ -256,7 +293,7 @@ also quaternions and numbers), \code{normalize(v)}, and scalar
 
 \section{Command semantics}
 
-\subsection{\kw{new} --- create an object}
+\subsection{\kw{new} --- create an object}\label{sec:new}
 
 \begin{lstlisting}
 NEW POINT    { field = expr, ... }
@@ -265,13 +302,19 @@ NEW CUBOID   { field = expr, ... }        (alias: NEW CUBE)
 NEW TORUS    { field = expr, ... }
 NEW DISK     { field = expr, ... }        (alias: NEW DISC)
 NEW CYLINDER { field = expr, ... }
+NEW DUMBBELL { field = expr, ... }        (alias: NEW DUMBELL)
+
+NEW <shape> AS <name> { field = expr, ... }   (register a user name)
 \end{lstlisting}
 
 Creates one \emph{physical object} and prints its handle (\code{obj0},
 \code{obj1}, \ldots, numbered by position). Defaults: mass 1, at the
 origin, at rest, no charge; sphere radius 1; cuboid half-extents
 \code{[1,1,1]}; torus \code{ring\_radius} 1, \code{tube\_radius} 0.25;
-disk radius 1; cylinder radius 0.5, \code{half\_height} 1.
+disk radius 1; cylinder radius 0.5, \code{half\_height} 1; dumbbell
+\code{m1} $= 1$, \code{m2} $= 1$, \code{m\_rod} $= 0.5$, \code{r1}
+$= 0.25$, \code{r2} $= 0.25$, \code{rod\_radius} $= 0.1$,
+\code{length} $= 1$ (total mass 2.5).
 
 Initializer fields: \code{mass, charge, position, velocity, momentum,
 orientation, angular\_velocity, angular\_momentum, radius} (spheres,
@@ -279,7 +322,8 @@ disks, cylinders), \code{half\_extents} (cuboids), \code{ring\_radius,
 tube\_radius} (tori --- or the \code{inner\_radius} +
 \code{outer\_radius} pair, see below), \code{height, half\_height}
 (cylinders; \kw{height} is the full height $= 2\cdot$\code{half\_height}),
-\code{inertia\_tensor, inverse\_inertia\_tensor,
+\code{m1, m2, m\_rod, r1, r2, rod\_radius, length} (dumbbells, see
+below), \code{inertia\_tensor, inverse\_inertia\_tensor,
 magnetic\_moment\_tensor, force, torque, id, inverse\_mass}.
 
 A torus can be sized two ways: directly (\code{ring\_radius} $c$ = the
@@ -302,6 +346,48 @@ works in either order too (checking each write against the
 half-updated default would have refused one of the two orders).
 \code{inner\_radius = 0} is legal --- that is the \textbf{horn torus},
 whose tube touches the axis --- on \kw{new} and on \kw{set} alike.
+
+\textbf{The dumbbell} is ONE rigid body: two solid spheres joined by
+a solid rod. Its seven part fields are \code{m1}, \code{m2},
+\code{m\_rod} (the two sphere masses and the rod mass), \code{r1},
+\code{r2} (the sphere radii), \code{rod\_radius} (alias
+\code{rod\_r}) and \code{length} (alias \code{len} --- the distance
+between the sphere centers). Like the torus radius pair, the part
+fields are \textbf{deferred}: they are collected during the
+initializer list and resolved \emph{once} at its end, so they are
+order-independent and validated once against the final values. The
+constructor places the local origin at the composite \textbf{center
+of mass} --- the sphere centers sit at
+$z_1 = -(m_2 + m_{\mathrm{rod}}/2)\,L/M$ and
+$z_2 = +(m_1 + m_{\mathrm{rod}}/2)\,L/M$ on the body $z$-axis, which
+makes $m_1 z_1 + m_2 z_2 + m_{\mathrm{rod}}(z_1+z_2)/2 = 0$ an
+identity --- so \code{position} is the COM, exactly as for every
+other shape. The inertia tensor is the exact composite (solid-sphere
+$\tfrac25 m r^2$ terms with parallel-axis shifts, plus the rod), and
+the surface is the exact union of the three parts. It is the
+simulator's first non-centrally-symmetric shape; collisions against
+every other shape decompose exactly over its parts (see
+\code{collision\_detection.pdf}). The part fields remain readable
+\emph{and writable} after creation (\S5.2).
+
+\textbf{\kw{as} registers a user name for the object.} The name is a
+string literal (\code{NEW SPHERE AS "ball"}) or a bare identifier
+(\code{NEW SPHERE AS ball}); a bare identifier is first resolved
+against a function parameter or \kw{let} variable holding a string
+--- so a function can name the object it creates from its argument
+(\S\ref{sec:userdefs}, Example 14) --- and otherwise the
+identifier's own spelling is the name. The reply shows both handles:
+\code{obj0 as ball}. Named paths then work everywhere a positional
+path does --- \code{ball.mass}, \code{dumbell0.position.x}, in
+\kw{set}/\kw{get} and in bare expressions. Names are
+case-insensitive identifiers; \code{system}/\code{sys} and the
+positional spellings are refused (\code{`system` is reserved},
+\code{`obj7` is reserved for positional paths}), and so are
+duplicates (\code{the name `d` already refers to obj0 --- DEL it or
+pick another name}). The registry follows every renumbering:
+\kw{del} removes the deleted object's name and shifts the names of
+higher-numbered objects down with their objects, and the \kw{box}
+commands do the same when walls come and go.
 
 Four guarantees make initializers forgiving:
 \begin{enumerate}
@@ -329,10 +415,17 @@ Four guarantees make initializers forgiving:
 
 \subsection{\kw{set} / \kw{get} --- write and read any field}
 
-A \emph{path} is \code{objN.field} or \code{system.field}, optionally
-followed by a component \code{.x .y .z} (vectors) or
-\code{.w .x .y .z} (quaternions). Component writes are safe
-read-modify-write operations through the full field's get/set pair.
+A \emph{path} is \code{objN.field}, \code{system.field},
+\code{contactK.field} (\S\ref{sec:collide}) or \code{name.field} for
+a name registered with \kw{new} \ldots{} \kw{as}
+(\S\ref{sec:new}), optionally followed by a component
+\code{.x .y .z} (vectors) or \code{.w .x .y .z} (quaternions).
+Component writes are safe read-modify-write operations through the
+full field's get/set pair. Every object also has six
+\textbf{component shorthands}: \code{.x .y .z} read and write the
+position components and \code{.vx .vy .vz} the velocity components
+--- \code{ball.x} is \code{ball.position.x}, \code{SET ball.vx = 2}
+is a velocity write.
 
 \textbf{Object fields} (R = readable, W = writable):
 
@@ -356,6 +449,11 @@ read-modify-write operations through the full field's get/set pair.
 \code{ring\_radius}, \code{tube\_radius} & number & RW & tori only; write recomputes inertia\\
 \code{inner\_radius}, \code{outer\_radius} & number & RW & tori only, derived ($\mathrm{inner} = c-a$, $\mathrm{outer} = c+a$); writing one holds the other fixed; \code{inner\_radius} accepts $\ge 0$ (0 = the horn torus; the other radii must be $> 0$)\\
 \code{height}, \code{half\_height} & number & RW & cylinders only; \code{height} is the full height ($= 2\cdot$\code{half\_height}); write recomputes inertia\\
+\code{m1}, \code{m2}, \code{m\_rod} & number & RW & dumbbells only: the two sphere masses and the rod mass; writing rebuilds the body --- total mass, the COM offsets and the inertia tensor all follow (position and velocities are untouched)\\
+\code{r1}, \code{r2}, \code{rod\_radius} & number & RW & dumbbells only: the sphere radii and the rod radius (alias \code{rod\_r}); same rebuild on write\\
+\code{length} & number & RW & dumbbells only: distance between the sphere centers (alias \code{len}); same rebuild on write\\
+\code{x}, \code{y}, \code{z} & number & RW & every object: shorthands for \code{position.x/.y/.z}\\
+\code{vx}, \code{vy}, \code{vz} & number & RW & every object: shorthands for \code{velocity.x/.y/.z}\\
 \code{boundary}, \code{shape} & string & R & description of the shape\\
 \code{kinetic\_energy}, \code{energy} & number & R & $\tfrac12 m|v|^2 + \tfrac12\,\omega\!\cdot\!L$\\
 \code{force} & vec3 & RW & constant external force during \kw{step}/\kw{run}\\
@@ -428,7 +526,7 @@ feature}.
 \kw{laplace} $n$ & Laplace--Runge--Lenz vector of object $n$ about the center of mass, $k = G\,M_{\mathrm{total}}$\\
 \kw{list} & one line per object\\
 \kw{del} $n$ & removes object $n$ (\textbf{later objects renumber!})\\
-\kw{reset} & wipes everything\\
+\kw{reset} & wipes everything (not to be confused with \code{SCENE RESET}, which re-initializes only the scene window's playback copy --- see \code{scene\_info.pdf})\\
 \kw{help} & the quick-reference card\\
 \end{tabular}
 \end{center}
@@ -554,6 +652,112 @@ Bookkeeping:
       stale overlay survives the wipe.
 \end{itemize}
 
+\subsection{User definitions: \kw{def}, \kw{let}, \kw{funcs}, \kw{show}}
+\label{sec:userdefs}
+
+\begin{lstlisting}
+DEF name(param [= default], ...) { body }     (define a function)
+name(arg, ...)                                (call it)
+LET name = <expr>                             (session variable)
+FUNCS                                         (list signatures; alias: FUNCTIONS)
+SHOW name                                     (print a function's source)
+\end{lstlisting}
+
+\textbf{\kw{def} is a line form, not a grammar production.} A line
+that starts with \code{DEF } is recognized \emph{before} the ordinary
+grammar (\S3): the notebook captures everything up to the closing
+\code{\}} --- interactively it keeps prompting \code{...:=} for
+continuation lines until the brace closes; scripts and JupyterLab
+cells just keep reading --- and installs the function. The
+\textbf{body} is a sequence of ordinary commands, separated by
+newlines or \code{;}, in which the parameters act as variables.
+\textbf{Every body line is syntax-checked at definition time} (a typo
+fails the \kw{def} immediately, naming the body line), and
+\textbf{defaults are ordinary expressions evaluated once, at
+definition} (\kw{let} variables are visible in them).
+
+\textbf{Calling} uses the ordinary call syntax \code{name(arg, ...)}
+--- the same atom as \code{sqrt(2)}; a name that is not a builtin is
+looked up among your functions. Missing trailing arguments take their
+defaults (an argument with no default must be supplied). Each call
+pushes a \textbf{call frame} binding the parameters (depth cap: 32
+--- the language has no conditionals, so recursion could never
+terminate anyway) and runs the body lines through the same
+compile-and-execute pipeline as typed input. The call \textbf{returns
+the last body line's value} --- if that line is a \kw{set}, the call
+prints no \code{Out[n]}, exactly like \kw{set} itself. A failing body
+line aborts the call and the error names the function \emph{and} the
+line; lines that already ran keep their effects (each command's own
+guarantees still hold per line --- e.g.\ a failing \kw{new} inside a
+body is still transactional), so a partly-run call leaves no
+half-built object, only completed commands.
+
+\textbf{Editing is \kw{show} + re-\kw{def}.} \code{SHOW name} prints
+the definition verbatim, exactly as you typed it; redefining the same
+name replaces the old version and the reply appends
+\code{(redefined)}. \kw{funcs} lists every signature with its
+defaults.
+
+\textbf{\code{LET name = expr}} binds a session variable (reply:
+\code{name set}). It is visible in bare expressions, in function
+bodies, in \kw{def} defaults --- and, holding a string, it can
+\emph{name} things: \kw{new} \ldots{} \kw{as} and named paths resolve
+a bare identifier through the parameter/\kw{let} bindings first
+(\S\ref{sec:new}). Note \kw{get} takes only a \emph{path} (\S3), so a
+variable is read back as a bare expression: \code{g0}, not
+\code{GET g0}.
+
+A complete session (genuine output):
+
+\begin{lstlisting}
+In[1]:= let g0 = 9.81
+Out[1]= g0 set
+In[2]:= def drop(name, m = 1, h = 10) {
+  new sphere as name { mass = m, position = [0, h, 0] }
+  set system.gravity = [0, -g0, 0]
+}
+Out[2]= function drop(3 parameter(s)) defined — 2 body line(s)
+In[3]:= drop("ball")
+In[4]:= get ball.position.y
+Out[4]= 10
+In[5]:= drop("pebble", 0.1, 2)
+In[6]:= get pebble.mass
+Out[6]= 0.1
+In[7]:= funcs
+Out[7]= drop(name, m = 1, h = 10) — 2 body line(s); SHOW drop prints it
+In[8]:= show drop
+Out[8]= def drop(name, m = 1, h = 10) {
+  new sphere as name { mass = m, position = [0, h, 0] }
+  set system.gravity = [0, -g0, 0]
+}
+In[9]:= def drop(name, m = 1, h = 100) { new sphere as name { mass = m, position = [0, h, 0] }; set system.gravity = [0, -g0, 0] }
+Out[9]= function drop(3 parameter(s)) defined — 2 body line(s) (redefined)
+In[10]:= drop("skydiver")
+In[11]:= skydiver.y
+Out[11]= 100
+In[12]:= speed
+Err[12]: unknown name `speed` (define it with LET, pass it as a function parameter, or use `speed.field` for a registered object)
+\end{lstlisting}
+
+\emph{What to notice.} The function's \code{name} parameter holds a
+string, and \code{new sphere as name} inside the body names each
+created object from it --- \code{ball}, \code{pebble},
+\code{skydiver} --- so one definition mints a family of named
+objects. \code{drop("ball")} used both defaults; cell 9 is the edit
+loop (copy cell 8's \kw{show} output, change \code{h}, re-\kw{def}
+--- note \code{;} separating body lines works as well as newlines);
+calls 3, 5 and 10 print no \code{Out} because the last body line is a
+\kw{set}. Cell 12 is the bare-identifier error: execution-time
+resolution means the message can list every way to bind a name.
+
+Definition-time and call-time errors are specific: a reserved or
+builtin name is refused (\code{DEF: `norm` is a builtin function and
+cannot be redefined}), nested \kw{def} is refused, an empty body is
+refused, a missing non-default argument fails as
+\code{name(): missing argument `p` (it has no default)}, too many
+arguments fail naming the signature, and the depth cap fails as
+\code{function call depth limit (32) exceeded}.
+
 \section{The notebook (cells, editing, magics)}
 
 \subsection{Cells}
@@ -624,10 +828,17 @@ Add               <- pops 2,12 pushes 14
 Store obj0.mass   <- pops 14, calls set_mass(14)
 \end{lstlisting}
 The machine's whole memory is a stack of typed values. Instructions:
-\code{Push}, \code{Load}, \code{Store}, \code{Add Sub Mul Div Neg},
-\code{PackList} (literals), \code{Call} (builtins),
-\code{NewObject}/\code{InitField}/\code{FinishNew}, \code{Delete},
-\code{ListObjects}, \code{Step}, \code{Run}, \code{SetMethod},
+\code{Push}, \code{Load}, \code{Store}, \code{LoadIdent} (a bare
+identifier --- parameter or \kw{let} variable, resolved at execution,
+\S\ref{sec:userdefs}), \code{StoreGlobal} (\kw{let}),
+\code{Add Sub Mul Div Neg},
+\code{PackList} (literals), \code{Call} (builtin or user function ---
+a user call runs each body line through this same compile-and-execute
+pipeline inside a call frame),
+\code{NewObject}/\code{InitField}/\code{FinishNew} (which also
+registers the \kw{as} name), \code{Delete},
+\code{ListObjects}, \code{ListFns}/\code{ShowFn}
+(\kw{funcs}/\kw{show}), \code{Step}, \code{Run}, \code{SetMethod},
 \code{Energy}, \code{CenterOfMass}, \code{TotalMomentum},
 \code{TotalAngularMomentum}, \code{Laplace}, \code{Reset}, \code{Help}.
 \code{Load}/\code{Store} go \emph{only} through the
@@ -636,7 +847,7 @@ simulator state, and every coupled invariant (mass$\leftrightarrow$inverse,
 inertia$\leftrightarrow$inverse, unit quaternions) is enforced on every
 write. When the program ends, the top of the stack becomes \code{Out[n]}.
 
-\section{Thirteen worked examples}
+\section{Fourteen worked examples}
 
 All transcripts are genuine program output.
 
@@ -1166,6 +1377,77 @@ ball-vs-anything collision tier is exact SDF geometry, not an
 approximation --- while every finite-size body bounces off both. The
 walls end the run bit-identically at rest.
 
+\subsection{Example 14 --- two dumbbells from a user-defined function}
+
+The two-release finale: a user function (\S\ref{sec:userdefs}) that
+builds \textbf{named dumbbells} (\S\ref{sec:new}), called twice to
+launch a pair of tumbling dumbbells at each other, off-center and
+spinning. No walls this time --- so \emph{all three} conserved
+quantities must survive the collisions. The script is
+\code{scripts/collisions/12\_two\_dumbbells.posim}; this transcript
+replays it.
+
+\begin{lstlisting}
+In[1]:= set system.g_constant = 0
+In[2]:= def create_dumbell(name, m1 = 1, m2 = 1, m_rod = 0.5, r1 = 0.25, r2 = 0.25, rod_radius = 0.1, length = 1, position = [0, 0, 0], velocity = [0, 0, 0], angular_velocity = [0, 0, 0]) {
+  new dumbbell as name { m1 = m1, m2 = m2, m_rod = m_rod, r1 = r1, r2 = r2, rod_radius = rod_radius, length = length, position = position, velocity = velocity, angular_velocity = angular_velocity }
+}
+Out[2]= function create_dumbell(11 parameter(s)) defined — 1 body line(s)
+In[3]:= create_dumbell("dumbell0", 1, 2, 0.5, 0.25, 0.25, 0.1, 1, [-2, 0.15, 0], [1.5, 0, 0], [0, 0, 0.6])
+Out[3]= obj0 as dumbell0
+In[4]:= create_dumbell("dumbell1", 2, 1, 0.4, 0.3, 0.2, 0.08, 1.2, [2, -0.15, 0], [-1.5, 0, 0], [0.4, 0, 0])
+Out[4]= obj1 as dumbell1
+In[5]:= list
+Out[5]= obj0: dumbbell r1=0.25 r2=0.25 rod_r=0.1 len=1, mass=3.5, charge=0, pos=[-2, 0.15, 0]
+obj1: dumbbell r1=0.3 r2=0.2 rod_r=0.08 len=1.2, mass=3.4, charge=0, pos=[2, -0.15, 0]
+In[6]:= get dumbell0.m1
+Out[6]= 1
+In[7]:= get dumbell1.m_rod
+Out[7]= 0.3999999999999999
+In[8]:= get dumbell0.vx
+Out[8]= 1.5
+In[9]:= energy
+Out[9]= 7.865310611764706
+In[10]:= momentum
+Out[10]= [0.15000000000000036, 0, 0]
+In[11]:= angmom
+Out[11]= [0.4443030588235295, 0, -1.5059999999999998]
+In[12]:= run 3 steps 60
+Out[12]= t = 3 (3861 solver steps, 60 snapshots, |dE/E| = 9.463e-11, 2 collision(s) — CONTACTS lists them)
+In[13]:= energy
+Out[13]= 7.865310611020375
+In[14]:= momentum
+Out[14]= [0.15000000000000036, 0, 0]
+In[15]:= angmom
+Out[15]= [0.44430305882373156, -0.000000000000009547918011776346, -1.505999999999855]
+In[16]:= get system.collisions
+Out[16]= 2
+\end{lstlisting}
+
+\emph{What to notice.} Cell 2 is one \kw{def} whose single body line
+does everything: \code{new dumbbell as name \{ ... \}} forwards all
+eleven parameters, and because \code{name} arrives as a string
+(\code{"dumbell0"}, \code{"dumbell1"}), each call registers the name
+it was given --- \code{Out[3]}/\code{Out[4]} show both handles,
+\kw{list} shows the part geometry, and cells 6--8 read the parts and
+the \code{.vx} shorthand through the names. (\code{Out[7]} reads 0.4
+back as \code{0.3999999999999999}: the parts are stored as mass
+\emph{fractions} of the total, so one reconstruction rounding step
+shows through --- 15 correct digits.) Then the physics: two tumbling,
+asymmetric rigid bodies meet off-center, collide \textbf{twice} (cell
+16), and every conserved quantity survives the real CVODE event
+handling. Energy: $7.865310611764706 \to 7.865310611020375$ --- the
+run banner prints \code{|dE/E| = 9.463e-11}. Momentum:
+\code{[0.15000000000000036, 0, 0]} \textbf{bit-identical}. Angular
+momentum about the origin --- the delicate one, orbital $r \times p$
+plus spin, exchanged between the two at every off-center impact:
+conserved to $\sim\!10^{-13}$ per component (\code{Out[11]} vs.\
+\code{Out[15]}), because the part-wise exact narrow phase applies the
+action--reaction impulse pair at one shared contact point. Contrast
+Example 13: there the infinitely massive walls absorbed momentum;
+here, with no walls, $E$, $P$ \emph{and} $L$ all hold at solver
+precision.
+
 \section{Error message tour}
 
 \begin{center}
@@ -1174,9 +1456,13 @@ walls end the run bit-identically at rest.
 \code{get obj7.mass} (no obj7) & \code{no object obj7}\\
 \code{get obj0.bogus} & \code{unknown object field `bogus' --- see HELP for the field list}\\
 \code{[1,0,0] * [0,1,0]} & \code{cannot multiply vec3 by vec3 (for vec3*vec3 use dot()/cross())}\\
-\code{set = 3} & \code{parse error at column 5: expected a path root (objN or system), found =}\\
+\code{set = 3} & \code{parse error at column 5: expected a path root (`objN` or `system`), found `=`}\\
 \code{run 1} under SPRK with $B\ne0$ & \code{SPRK method requires a separable Hamiltonian: magnetic field B must be zero ... use METHOD ADAMS or BDF}\\
-\code{bogusname} & \code{parse error ...: unknown name bogusname (expected a number, [x,y,z], objN.field, system.field, or a function call)}\\
+\code{bogusname} & \code{unknown name `bogusname` (define it with LET, pass it as a function parameter, or use `bogusname.field` for a registered object)}\\
+\code{get d.m1} (only \code{ball} is registered) & \code{no object named `d` (registered names: ["ball"]; NEW ... AS <name> creates one; positional paths are objN.field, contactK.field, system.field)}\\
+\code{new sphere as d} (name taken) & \code{the name `d` already refers to obj0 --- DEL it or pick another name}\\
+\code{new sphere as system} & \code{`system` is reserved}\\
+\code{show nosuch} & \code{no user function `nosuch` --- FUNCS lists the defined ones}\\
 \end{tabular}
 \end{center}
 

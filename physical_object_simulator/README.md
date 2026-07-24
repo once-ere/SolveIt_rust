@@ -6,11 +6,17 @@ integration runs through the pure-Rust SUNDIALS 7.7.0 translation
 (CVODE Adams/BDF, ARKODE symplectic SPRK). Zero `unsafe`, zero external
 crate dependencies, zero warnings.
 
-Latest release: six boundary shapes (`POINT`, `SPHERE`, `CUBOID`,
-`TORUS`, `DISK`, `CYLINDER`) with exact SDF-based collision detection,
-plus the `BOX` command — a rigid, infinitely massive bounding container
-realized as six static walls; 94 tests green (37 lib + 15 collision +
-9 conservation + 33 posim).
+Latest release: a programmable notebook and a compound rigid body —
+user-defined functions (`DEF name(param = default, ...) { body }`,
+every body line syntax-checked at definition, `FUNCS`/`SHOW` to list
+and edit), named objects (`NEW ... AS name`, plus `LET` variables and
+string literals), and the rigid `DUMBBELL` (two solid spheres plus a
+rod as ONE rigid body, exact part-wise collisions conserving E, P and
+L through real solver events); the scene window gains a permanent
+Reset button (with `SCENE RESET` — bit-identical re-initialization,
+Start re-runs) and a live labeled conserved-quantities readout (E, P
+and L); 99 tests green (39 lib + 16 collision + 9 conservation +
+35 posim).
 
 - `physical_object/` — library: `pub struct physical_object`, the
   unique union of the legacy `PointParticle`, `RigidBody` and
@@ -27,18 +33,18 @@ realized as six static walls; 94 tests green (37 lib + 15 collision +
 ## Documentation
 
 - [grammar.md](grammar.md) / [grammar.pdf](grammar.pdf) — the complete
-  command-language and notebook specification, with thirteen worked
+  command-language and notebook specification, with fourteen worked
   examples.
 - [physical_object_simulator.md](physical_object_simulator.md) /
   [physical_object_simulator.pdf](physical_object_simulator.pdf) — the
-  full solution guide for new users, with thirteen more worked examples.
+  full solution guide for new users, with fourteen more worked examples.
 - [scene_info.md](scene_info.md) / [scene_info.pdf](scene_info.pdf) —
   the graphical scene window: the simulator research survey, the
   protocol, and the UI.
 - [collision_detection.md](collision_detection.md) /
   [collision_detection.pdf](collision_detection.pdf) — the collision
   science reference, with documented example scripts in
-  `scripts/collisions/` (01–11).
+  `scripts/collisions/` (01–12).
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module responsibilities and
   pinned cross-module contracts.
 - [CLAUDE.md](CLAUDE.md) — working rules for contributors and agents.
@@ -52,7 +58,7 @@ cargo run -p physical_object --release --example kepler_orbit
 cargo run -p physical_object --release --example outer_solar_system
 cargo run -p physical_object --release --example tumbling_body
 cargo run -p physical_object --release --example charged_in_b_field
-cargo run -p posim -- --script scripts/collisions/11_box_of_shapes.posim
+cargo run -p posim -- --script scripts/collisions/12_two_dumbbells.posim
 cargo run -p posim -- --script my_session.posim
 cargo run -p posim -- --machine   # JSON protocol for front ends
 ```

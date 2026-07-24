@@ -56,6 +56,11 @@ pub enum Keyword {
     Status,
     Events,
     All,
+    /* user definitions and names */
+    As,
+    Let,
+    Funcs,
+    Dumbbell,
     /* collision commands */
     Collide,
     Contacts,
@@ -112,6 +117,10 @@ impl Keyword {
             "status" => Some(Keyword::Status),
             "events" => Some(Keyword::Events),
             "all" => Some(Keyword::All),
+            "as" => Some(Keyword::As),
+            "let" => Some(Keyword::Let),
+            "funcs" | "functions" => Some(Keyword::Funcs),
+            "dumbbell" | "dumbell" => Some(Keyword::Dumbbell),
             "collide" => Some(Keyword::Collide),
             "contacts" => Some(Keyword::Contacts),
             "on" => Some(Keyword::On),
@@ -127,6 +136,8 @@ pub enum TokKind {
     Keyword(Keyword),
     Ident(String),
     Number(f64),
+    /// A double-quoted string literal (escapes: \" \\ \n).
+    Str(String),
     LBracket,
     RBracket,
     LBrace,
@@ -155,6 +166,7 @@ impl fmt::Display for TokKind {
             TokKind::Keyword(k) => write!(f, "{k:?}"),
             TokKind::Ident(s) => write!(f, "identifier `{s}`"),
             TokKind::Number(n) => write!(f, "number {n}"),
+            TokKind::Str(st) => write!(f, "string \"{st}\""),
             TokKind::LBracket => write!(f, "`[`"),
             TokKind::RBracket => write!(f, "`]`"),
             TokKind::LBrace => write!(f, "`{{`"),
@@ -243,6 +255,37 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, String> {
             '/' => {
                 toks.push(Token { kind: TokKind::Slash, col });
                 i += 1;
+            }
+            '"' => {
+                /* string literal with minimal escapes */
+                let mut out = String::new();
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < chars.len() {
+                    match chars[j] {
+                        '"' => {
+                            closed = true;
+                            j += 1;
+                            break;
+                        }
+                        '\\' if j + 1 < chars.len() => {
+                            out.push(match chars[j + 1] {
+                                'n' => '\n',
+                                other => other, /* \" and \\ and anything else verbatim */
+                            });
+                            j += 2;
+                        }
+                        other => {
+                            out.push(other);
+                            j += 1;
+                        }
+                    }
+                }
+                if !closed {
+                    return Err(format!("lexical error at column {col}: unterminated string"));
+                }
+                toks.push(Token { kind: TokKind::Str(out), col });
+                i = j;
             }
             c if c.is_ascii_digit() => {
                 let (num, len) = lex_number(&chars[i..], col)?;

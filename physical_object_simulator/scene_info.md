@@ -37,8 +37,10 @@ showing 4 entities; SCENE START begins the evolution — HELP lists all scene co
 ```
 
 The window shows **all simulator entities** (points, spheres, cuboids,
-tori, disks, cylinders), a ground grid, the world axes, motion trails,
-and object labels. If the notebook created a rigid bounding box
+tori, disks, cylinders, dumbbells), a ground grid, the world axes,
+motion trails, and object labels (an object registered with
+`NEW ... AS <name>` is labeled by that name). If the notebook created
+a rigid bounding box
 (`BOX <size>`), the window draws its interior as a dashed light-blue
 wireframe — the six infinitely-massive wall slabs that implement it
 are represented by that wireframe, never drawn as six giant cuboids.
@@ -59,6 +61,7 @@ dependencies, zero `unsafe` code.
 | **⏸ Pause** | freeze the evolution (resume with Start) |
 | **■ Stop** | halt evolution *and clear the recorded history* |
 | **◀ Reverse** | play **backward** through the recorded history |
+| **↺ Reset** | re-initialize the playback: **every value and the time return to their initial values**; Start then runs the simulation again from the beginning |
 | **⇠ / ⇢** | single step backward / forward |
 | **dt `____` Set** | change the playback time step |
 | **🔍+ / 🔍−** | zoom in / out |
@@ -67,7 +70,18 @@ dependencies, zero `unsafe` code.
 | **Contacts** | toggle contact-normal arrows drawn at collision points |
 | **?** | show the controls cheat-sheet |
 
-### 1.2 The status bar (bottom of the window)
+### 1.2 The "conserved quantities" readout (top-left)
+
+A permanent labeled overlay (just below the toolbar) shows the three
+conserved quantities of the playback copy, updated live at every
+frame: **E** (total energy), **P** (total linear momentum) and **L**
+(total angular momentum about the origin). P and L are printed as
+their three components plus the magnitude `|.|`. Watching E, P and L
+sit still through a collision *is* the physics lesson — the values
+come straight from the frame protocol's `energy`, `p` and `l` fields
+(section 5.1), computed on the playback copy every tick.
+
+### 1.3 The status bar (bottom of the window)
 
 A live one-line dashboard: **connection dot** (green = connected to
 posim), playback **mode** (`stopped` / `running` / `paused` /
@@ -76,7 +90,7 @@ posim), playback **mode** (`stopped` / `running` / `paused` /
 latest playback step), **history** (frames available for Reverse), the
 **camera** yaw/pitch/distance, and the rendering **fps**.
 
-### 1.3 Controls (mouse & keyboard) — all verified in a real browser
+### 1.4 Controls (mouse & keyboard) — all verified in a real browser
 
 | Gesture | Effect |
 |---|---|
@@ -287,6 +301,7 @@ a sum. Full grammar in `grammar.md` §3.
 | `SCENE STOP` | Halt evolution and clear the recorded history. |
 | `SCENE PAUSE` | Freeze evolution; `SCENE START` resumes, history kept. |
 | `SCENE REVERSE` | Play **backward in time** through the recorded history; pauses automatically at the beginning. Errors if no history exists yet. |
+| `SCENE RESET` | Re-initialize the playback: **every mutable value and the time return to their initial values** — the state last synced at `SCENE CREATE`/`SCENE REFRESH` — bit-identically; history and the step counter clear and the mode returns to Stopped. `SCENE START` (or the window's Start button) then re-runs the simulation from the beginning. The toolbar **↺ Reset** button calls the very same primitive. |
 | `SCENE SET_TIME_STEP dt` | Set the playback time step (must be positive and finite). |
 | `SCENE STATUS` | Report URL, connected windows, mode, t, dt, steps, history size, entities, hidden list, camera. |
 | `SCENE EVENTS` | Drain and print the asynchronous window → notebook event queue. |
@@ -304,6 +319,11 @@ Notes for the curious:
 * `RESET` in the notebook keeps the window open and re-syncs it to the
   now-empty system — including clearing the box wireframe and wall
   flags if a `BOX` existed.
+* `SCENE RESET` is **not** the notebook's `RESET`: the notebook
+  command empties the system itself, while `SCENE RESET` only rewinds
+  the window's playback copy to the state it was last synced with.
+  The reply spells it out:
+  `scene playback reset to its initial state (t = 0, 1 entity); Start runs the simulation again from the beginning`.
 
 ---
 
@@ -322,7 +342,8 @@ frame, both directions.
              {"i":3,"mass":2.0,"charge":0.0,"shape":"cuboid",
               "half_extents":[0.3,0.2,0.1]}]}
 ```
-Sent on connect, on `SCENE REFRESH`/`REDRAW`, and after hide/show.
+Sent on connect, on `SCENE REFRESH`/`REDRAW`, after hide/show, and
+after a playback reset (`SCENE RESET` / the Reset button).
 Geometry travels **once** (the Rapier idea). Note that `BOX <size>` /
 `BOX OFF` in the notebook do **not** push a new init on their own —
 box changes reach an open window only via `SCENE REFRESH`, and the
@@ -332,16 +353,24 @@ is `RESET`, which re-syncs the window itself and clears the box
 wireframe and wall flags automatically.
 
 Each entity carries its shape-specific geometry: a `sphere` its
-`radius`, a `cuboid` its `half_extents`, and — new in the
-shapes-and-box release — a `torus` its `ring_radius` and
-`tube_radius`, a `disk` its `radius`, a `cylinder` its `radius` and
-`half_height`:
+`radius`, a `cuboid` its `half_extents`, a `torus` its `ring_radius`
+and `tube_radius`, a `disk` its `radius`, a `cylinder` its `radius`
+and `half_height`, and — new in the dumbbell release — a `dumbbell`
+its two sphere radii `r1`/`r2`, its `rod_radius`, and the
+sphere-centre offsets `z1`/`z2` along the local axis (the local
+origin is the composite COM, so the offsets are mass-weighted and
+unequal). Any entity whose object was registered with
+`NEW ... AS <name>` also carries `"name"` — the window prefers it
+over `objN` for the label:
 
 ```json
 {"i":6,"mass":1.0,"charge":0.0,"shape":"torus","ring_radius":1.5,"tube_radius":0.5}
 {"i":9,"mass":0.6666666666666666,"charge":0.0,"shape":"disk","radius":1.0}
 {"i":11,"mass":2.0,"charge":0.0,"shape":"cylinder","radius":0.5,"half_height":0.75}
 {"i":0,"mass":0.0,"charge":0.0,"shape":"cuboid","half_extents":[1.0,4.0,4.0],"wall":true}
+{"i":0,"mass":3.5,"charge":0.0,"shape":"dumbbell","r1":0.25,"r2":0.25,
+ "rod_radius":0.1,"z1":-0.6428571428571429,"z2":0.35714285714285715,
+ "name":"dumbell0"}
 ```
 
 Two optional fields describe the rigid bounding box: each of the six
@@ -351,7 +380,8 @@ skips it in the body-drawing pass), and the message top level gains
 
 ```json
 {"type":"frame","t":1.234,"dt":0.002,"mode":"running","steps":617,
- "history":617,"energy":-592.49,"hidden":[],
+ "history":617,"energy":-592.49,
+ "p":[0.15,0.0,0.0],"l":[0.4443,0.0,-1.506],"hidden":[],
  "contacts":[{"i":0,"j":1,"point":[0,0,0],"normal":[1,0,0],"impulse":2.0}],
  "bodies":[[x,y,z,qw,qx,qy,qz], ...]}
 ```
@@ -366,6 +396,12 @@ with **Contacts** / `C`). Verified live: a head-on elastic impact
 broadcasts `normal [1,0,0], point [0,0,0], impulse 2.0` — the exact
 analytic values — and the arrow renders at the projected contact point.
 
+Alongside `energy`, every frame now carries the other two conserved
+totals, computed on the playback copy every tick: `p` is the **total
+linear momentum** and `l` the **total angular momentum about the
+origin** (each `[x,y,z]`). These are exactly the numbers the
+"conserved quantities" readout (section 1.2) displays.
+
 ```json
 {"type":"camera","camera":{"yaw":...,"pitch":...,"dist":...,"target":[...]}}
 ```
@@ -376,7 +412,7 @@ so every window follows.
 
 ```json
 {"type":"cmd","action":"start"}                  // toolbar buttons:
-   // start | pause | stop | reverse | step | step_back | set_dt | refresh
+   // start | pause | stop | reverse | reset | step | step_back | set_dt | refresh
 {"type":"cmd","action":"set_dt","value":0.005}
 {"type":"camera","yaw":-92,"pitch":71,"dist":7.9,"target":[0,0,0]}
    // gesture sync, throttled to 10 Hz, so SCENE STATUS matches the screen
@@ -426,6 +462,31 @@ posim process
   circles) and four tube cross-sections — enough to read the hole and
   the spin; a **disk** is its rim plus two diameters; a **cylinder**
   is its two cap rims plus four side lines.
+* **The dumbbell renderer** — a **dumbbell** is drawn as one rigid
+  body: two radial-gradient-shaded spheres (radii `r1`, `r2`) at
+  their COM offsets `z1`, `z2` rotated by the body quaternion, joined
+  by the rod's **four silhouette lines** (the lines between the
+  sphere centres, offset radially by `rod_radius` in four
+  directions). Because the offsets are mass-weighted the heavier end
+  sits closer to the drawn position — the spin and the asymmetry are
+  both visible.
+* **The conserved-quantities readout** — a permanent labeled overlay
+  (`id="hud"`, top-left under the toolbar) rebuilt on every frame
+  from the frame message's `energy`, `p` and `l` fields: an `E` line
+  (8 digits) and `P`/`L` lines showing the three components plus the
+  `|.|` magnitude (5 digits). Entity labels, drawn in the body pass,
+  prefer the init entity's `"name"` (the user's `NEW ... AS`
+  registration) and fall back to `objN`.
+* **`Shared.initial` + `reset_playback`** — the playback state keeps
+  an `initial` snapshot: the system as last synced from the notebook
+  (set at `SCENE CREATE` and by every `SCENE REFRESH`/`RESET`
+  re-sync). `reset_playback` restores it as a bit-identical clone —
+  every mutable value and the time return to their initial values —
+  clears the history ring and the step counter, returns the mode to
+  Stopped, and flags a fresh init for every window. Three doors, one
+  primitive: the toolbar **↺ Reset** button, the window's `reset`
+  command, and the notebook's `SCENE RESET` all land in the same
+  function.
 * **The rigid bounding box** — when the init message carries `"box"`,
   the page strokes the interior cube as a dashed `#5d84a8` wireframe
   (12 edges, drawn just after the grid, beneath trails and bodies).
@@ -536,6 +597,43 @@ workspace suite is now 94 tests: 37 lib + 15 collision +
   contact arrows (2,218 pixels); toolbar Start and Reverse were
   exercised through real DOM clicks; the JS console stayed free of
   errors.
+
+**Reset + conserved-quantities release (2026-07-24).** The workspace
+suite is now **99 tests: 39 lib + 16 collision + 9 conservation +
+35 posim**, zero warnings. What the new layers pin down:
+
+* **Reset is a true re-initialization.** The posim test
+  `reset_restores_the_initial_state_and_start_reruns` runs the
+  playback forward (≥ 10 steps), calls the reset primitive, and
+  asserts the mode is Stopped, the time is back to its initial value,
+  the packed 13-per-object state is **bit-identical** to the initial
+  pack, and the step counter is 0 — then sets Running again and
+  asserts the simulation re-starts. The page-serve test additionally
+  asserts the permanent `id="bt-reset"` button is in the served HTML,
+  and `scene_commands_compile` covers `SCENE RESET`.
+* **Reset verified live.** In a real browser session the demo was run
+  to t = 0.72, the toolbar Reset was clicked: mode `stopped`, t = 0,
+  history = 0, and the body's state bit-identically back at its start
+  values; clicking Start then set the window running again from the
+  beginning.
+* **The protocol carries the new fields.** The WebSocket session test
+  (`websocket_session_end_to_end`) asserts every broadcast frame
+  contains `"p":[` and `"l":[`;
+  `box_shapes_and_wall_flags_reach_the_init_message` asserts the init
+  JSON carries the registered user name (`"name":"ringo"`).
+* **The dumbbell demo, live.** The two-dumbbell collision demo
+  (`scripts/collisions/12_two_dumbbells.posim` — two user-named
+  dumbbells built by a user-defined function, colliding off-center
+  with spin) was played back in a real browser window: the entity
+  labels read `dumbell0` and `dumbell1`, and the conserved-quantities
+  readout showed
+  `E = 7.86531061, P = [0.15000, 0.00000, 0.00000] |.| = 0.15000, L = [0.44430, 0.00000, -1.50600] |.| = 1.57017`
+  **identically before and after the impact** (L's y component showed
+  `-1.31228e-13` after — machine-epsilon noise). The notebook run of
+  the same script reports, through 2 real CVODE collision events:
+  `t = 3 (3861 solver steps, 60 snapshots, |dE/E| = 9.463e-11, 2 collision(s) — CONTACTS lists them)`,
+  with the total momentum `[0.15000000000000036, 0, 0]`
+  **bit-identical** before and after.
 
 ---
 

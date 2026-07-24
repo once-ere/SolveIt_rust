@@ -148,6 +148,12 @@ pub fn separation_at(
             // sphere/point vs sphere/point: center distance minus radii.
             (pb - pa).norm() - (radius_of(ba) + radius_of(bb))
         }
+        (Boundary::Dumbbell { .. }, b) if !is_ball(b) => {
+            dumbbell_vs_any_separation(ba, pa, qa, bb, pb, qb)
+        }
+        (a, Boundary::Dumbbell { .. }) if !is_ball(a) => {
+            dumbbell_vs_any_separation(bb, pb, qb, ba, pa, qa)
+        }
         (_, b) if is_ball(b) => {
             // torus/disk/cylinder vs ball: the shape's exact SDF at the
             // ball center (in the shape frame), minus the ball radius.
@@ -170,6 +176,46 @@ pub fn separation_at(
             support_axis_separation(ba, pa, qa, bb, pb, qb).0
         }
     }
+}
+
+/// The three parts of a dumbbell, at a given world pose: the two
+/// spheres as `(world center, radius)` and the rod as a free-standing
+/// cylinder `(boundary, world center)` sharing the dumbbell's
+/// orientation.
+fn dumbbell_parts(
+    bd: &Boundary,
+    pd: Vec3,
+    qd: Quat,
+) -> ((Vec3, f64), (Vec3, f64), (Boundary, Vec3)) {
+    let Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } = bd else {
+        unreachable!("dumbbell_parts needs a dumbbell")
+    };
+    let c1 = qd.rotate(Vec3::new(0.0, 0.0, *z1)) + pd;
+    let c2 = qd.rotate(Vec3::new(0.0, 0.0, *z2)) + pd;
+    let zc = 0.5 * (z1 + z2);
+    let rod = Boundary::Cylinder { radius: *rod_radius, half_height: 0.5 * (z2 - z1) };
+    let rod_p = qd.rotate(Vec3::new(0.0, 0.0, zc)) + pd;
+    ((c1, *r1), (c2, *r2), (rod, rod_p))
+}
+
+/// Dumbbell vs any extended shape, decomposed over the dumbbell's
+/// parts: the two sphere parts use the OTHER shape's exact SDF at
+/// their centers (exact for every shape, including another dumbbell's
+/// union SDF), the rod recurses as a free-standing cylinder — so only
+/// rod-vs-rod ever reaches the approximate support-axis tier.
+fn dumbbell_vs_any_separation(
+    bd: &Boundary,
+    pd: Vec3,
+    qd: Quat,
+    bx: &Boundary,
+    px: Vec3,
+    qx: Quat,
+) -> f64 {
+    let ((c1, r1), (c2, r2), (rod, rod_p)) = dumbbell_parts(bd, pd, qd);
+    let s1 = bx.signed_distance(&qx.inverse().rotate(c1 - px)) - r1;
+    let s2 = bx.signed_distance(&qx.inverse().rotate(c2 - px)) - r2;
+    let s3 = separation_at(&rod, rod_p, qd, bx, px, qx);
+    s1.min(s2).min(s3)
 }
 
 /// Support-axis separation for extended-vs-extended pairs: evaluates
@@ -196,7 +242,10 @@ fn support_axis_separation(
             let cols = mat_columns(&q.to_rotation_matrix());
             out.extend_from_slice(&cols);
         }
-        Boundary::Torus { .. } | Boundary::Disk { .. } | Boundary::Cylinder { .. } => {
+        Boundary::Torus { .. }
+        | Boundary::Disk { .. }
+        | Boundary::Cylinder { .. }
+        | Boundary::Dumbbell { .. } => {
             out.push(q.rotate(Vec3::new(0.0, 0.0, 1.0)));
         }
         _ => {}
@@ -241,13 +290,19 @@ fn support_axis_separation(
     let mut best_sep = f64::NEG_INFINITY;
     let mut best_axis = Vec3::new(1.0, 0.0, 0.0);
     for l in axes {
-        let ea = support_extent(ba, qa.inverse().rotate(l));
-        let eb = support_extent(bb, qb.inverse().rotate(l));
-        let sep = d.dot(l).abs() - (ea + eb);
+        // Directed SAT gap, evaluated for both orientations of the
+        // axis: gap(+l) = d·l − h_a(l) − h_b(−l). For centrally
+        // symmetric shapes h(−u) = h(u) and this reduces exactly to
+        // the classic |d·l| − (e_a + e_b); the dumbbell's off-center
+        // spheres need the general form.
+        let ua = qa.inverse().rotate(l);
+        let ub = qb.inverse().rotate(l);
+        let g_pos = d.dot(l) - support_extent(ba, ua) - support_extent(bb, -ub);
+        let g_neg = -d.dot(l) - support_extent(ba, -ua) - support_extent(bb, ub);
+        let (sep, oriented) = if g_pos >= g_neg { (g_pos, l) } else { (g_neg, -l) };
         if sep > best_sep {
             best_sep = sep;
-            // Orient the axis from a toward b.
-            best_axis = if d.dot(l) >= 0.0 { l } else { -l };
+            best_axis = oriented; // points from a toward b
         }
     }
     (best_sep, best_axis)
@@ -294,17 +349,27 @@ pub fn world_aabb(obj: &physical_object) -> (Vec3, Vec3) {
             let e = Vec3::new(ext(0), ext(1), ext(2));
             (p - e, p + e)
         }
-        b @ (Boundary::Torus { .. } | Boundary::Disk { .. } | Boundary::Cylinder { .. }) => {
-            // Extent along each world axis = the support extent of the
-            // shape along that axis pulled into the body frame (exact).
+        b @ (Boundary::Torus { .. }
+        | Boundary::Disk { .. }
+        | Boundary::Cylinder { .. }
+        | Boundary::Dumbbell { .. }) => {
+            // Extent along each world axis = the directed support of
+            // the shape along ±axis pulled into the body frame (exact;
+            // the dumbbell is not centrally symmetric, so + and − can
+            // genuinely differ).
             let qi = obj.get_orientation().inverse();
             let ext = |axis: Vec3| support_extent(&b, qi.rotate(axis));
-            let e = Vec3::new(
+            let hi = Vec3::new(
                 ext(Vec3::new(1.0, 0.0, 0.0)),
                 ext(Vec3::new(0.0, 1.0, 0.0)),
                 ext(Vec3::new(0.0, 0.0, 1.0)),
             );
-            (p - e, p + e)
+            let lo = Vec3::new(
+                ext(Vec3::new(-1.0, 0.0, 0.0)),
+                ext(Vec3::new(0.0, -1.0, 0.0)),
+                ext(Vec3::new(0.0, 0.0, -1.0)),
+            );
+            (p - lo, p + hi)
         }
     }
 }
@@ -412,11 +477,30 @@ pub fn contact_geometry(
     b: &physical_object,
     tol: f64,
 ) -> Option<ContactGeometry> {
-    let ba = a.get_boundary();
-    let bb = b.get_boundary();
-    let (pa, qa) = (a.get_position(), a.get_orientation());
-    let (pb, qb) = (b.get_position(), b.get_orientation());
+    contact_geometry_at(
+        &a.get_boundary(),
+        a.get_position(),
+        a.get_orientation(),
+        &b.get_boundary(),
+        b.get_position(),
+        b.get_orientation(),
+        tol,
+    )
+}
 
+/// Pose-level narrow phase (the dumbbell decomposition recurses into
+/// this with synthesized part boundaries). The returned normal points
+/// from the first shape toward the second.
+fn contact_geometry_at(
+    ba: &Boundary,
+    pa: Vec3,
+    qa: Quat,
+    bb: &Boundary,
+    pb: Vec3,
+    qb: Quat,
+    tol: f64,
+) -> Option<ContactGeometry> {
+    let (ba, bb) = (*ba, *bb);
     match (&ba, &bb) {
         (Boundary::Cuboid { .. }, Boundary::Cuboid { .. }) => {
             cuboid_cuboid_contact(&ba, pa, qa, &bb, pb, qb, tol)
@@ -433,6 +517,13 @@ pub fn contact_geometry(
         (a, b) if is_ball(a) && is_ball(b) => {
             sphere_sphere_contact(radius_of(&ba), pa, radius_of(&bb), pb, tol)
         }
+        (Boundary::Dumbbell { .. }, b) if !is_ball(b) => {
+            dumbbell_vs_any_contact(&ba, pa, qa, &bb, pb, qb, tol)
+        }
+        (a, Boundary::Dumbbell { .. }) if !is_ball(a) => {
+            let g = dumbbell_vs_any_contact(&bb, pb, qb, &ba, pa, qa, tol)?;
+            Some(ContactGeometry { point: g.point, normal: -g.normal, depth: g.depth })
+        }
         (_, b) if is_ball(b) => {
             // a = torus/disk/cylinder, b = ball: helper returns the
             // normal shape→ball, which is already a→b here.
@@ -448,12 +539,107 @@ pub fn contact_geometry(
     }
 }
 
-/// Contact between a torus/disk/cylinder (`shape` at `ps`, `qs`) and a
-/// ball of radius `r` centered at `pball`, via the exact closest point
-/// on the shape's surface. The returned normal points from the
-/// **shape toward the ball**; `None` when separated by more than `tol`
-/// or geometrically degenerate (ball center on the torus centerline,
-/// exactly on the disk, or on the cylinder axis at side contact).
+/// Contact of a ball (radius `r`, center `p_ball`) against ANY shape,
+/// consolidating the per-shape helpers. The returned normal points
+/// from the **ball toward the shape**.
+fn ball_vs_shape_contact(
+    r: f64,
+    p_ball: Vec3,
+    bx: &Boundary,
+    px: Vec3,
+    qx: Quat,
+    tol: f64,
+) -> Option<ContactGeometry> {
+    match bx {
+        Boundary::Point | Boundary::Sphere { .. } => {
+            sphere_sphere_contact(r, p_ball, radius_of(bx), px, tol)
+        }
+        Boundary::Cuboid { .. } => sphere_cuboid_contact(r, p_ball, bx, px, qx, tol),
+        _ => {
+            // torus/disk/cylinder/dumbbell: helper returns shape→ball.
+            let g = round_ball_contact(bx, px, qx, r, p_ball, tol)?;
+            Some(ContactGeometry { point: g.point, normal: -g.normal, depth: g.depth })
+        }
+    }
+}
+
+/// Contact of a dumbbell against any extended shape, via the deepest
+/// of its three parts (the same decomposition as
+/// [`dumbbell_vs_any_separation`]). The returned normal points from
+/// the **dumbbell toward the other shape**.
+fn dumbbell_vs_any_contact(
+    bd: &Boundary,
+    pd: Vec3,
+    qd: Quat,
+    bx: &Boundary,
+    px: Vec3,
+    qx: Quat,
+    tol: f64,
+) -> Option<ContactGeometry> {
+    let ((c1, r1), (c2, r2), (rod, rod_p)) = dumbbell_parts(bd, pd, qd);
+    let s1 = bx.signed_distance(&qx.inverse().rotate(c1 - px)) - r1;
+    let s2 = bx.signed_distance(&qx.inverse().rotate(c2 - px)) - r2;
+    let s3 = separation_at(&rod, rod_p, qd, bx, px, qx);
+    // Deepest part first; fall through on degenerate geometry.
+    let mut order = [(s1, 0usize), (s2, 1), (s3, 2)];
+    order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, which) in order {
+        let g = match which {
+            0 => ball_vs_shape_contact(r1, c1, bx, px, qx, tol),
+            1 => ball_vs_shape_contact(r2, c2, bx, px, qx, tol),
+            _ => contact_geometry_at(&rod, rod_p, qd, bx, px, qx, tol),
+        };
+        if g.is_some() {
+            return g; // ball→shape and rod→shape are both dumbbell→shape
+        }
+    }
+    None
+}
+
+/// Closest point of a solid cylinder (radius, half-height, centered at
+/// `(0, 0, z_off)` in the local frame) to the point `c`: returns
+/// `(surface point, outward unit normal, signed distance)`, or `None`
+/// in the direction-free degenerate case.
+fn cylinder_closest(c: Vec3, radius: f64, half_height: f64, z_off: f64) -> Option<(Vec3, Vec3, f64)> {
+    let xy = Vec3::new(c.x, c.y, 0.0);
+    let s_xy = xy.norm();
+    let z = c.z - z_off;
+    let inside = s_xy <= radius && z.abs() <= half_height;
+    if inside {
+        // Point inside the solid: nearest feature (side wall or cap),
+        // like the sphere-in-cuboid branch.
+        let radial = if s_xy > 1e-12 { xy / s_xy } else { Vec3::new(1.0, 0.0, 0.0) };
+        let side_gap = radius - s_xy;
+        let cap_gap = half_height - z.abs();
+        if side_gap <= cap_gap {
+            let surface = radial * radius + Vec3::new(0.0, 0.0, c.z);
+            Some((surface, radial, -side_gap))
+        } else {
+            let sign = if z >= 0.0 { 1.0 } else { -1.0 };
+            let surface = Vec3::new(c.x, c.y, z_off + sign * half_height);
+            Some((surface, Vec3::new(0.0, 0.0, sign), -cap_gap))
+        }
+    } else {
+        // Outside: clamp to the solid cylinder.
+        let radial = if s_xy > 1e-12 { xy / s_xy } else { Vec3::zeros() };
+        let surface = radial * s_xy.min(radius)
+            + Vec3::new(0.0, 0.0, z_off + z.clamp(-half_height, half_height));
+        let delta = c - surface;
+        let dist = delta.norm();
+        if dist < 1e-12 {
+            return None; // exactly on the surface with no direction
+        }
+        Some((surface, delta / dist, dist))
+    }
+}
+
+/// Contact between a torus/disk/cylinder/dumbbell (`shape` at `ps`,
+/// `qs`) and a ball of radius `r` centered at `pball`, via the exact
+/// closest point on the shape's surface. The returned normal points
+/// from the **shape toward the ball**; `None` when separated by more
+/// than `tol` or geometrically degenerate (ball center on the torus
+/// centerline, exactly on the disk, on the cylinder axis at side
+/// contact, or on a dumbbell sphere center).
 fn round_ball_contact(
     shape: &Boundary,
     ps: Vec3,
@@ -491,35 +677,44 @@ fn round_ball_contact(
             (surface, delta / dist, dist)
         }
         Boundary::Cylinder { radius, half_height } => {
-            let inside = s_xy <= *radius && c.z.abs() <= *half_height;
-            if inside {
-                // Ball center inside the solid: nearest feature (side
-                // wall or cap), like the sphere-in-cuboid branch.
-                let radial = if s_xy > 1e-12 { xy / s_xy } else { Vec3::new(1.0, 0.0, 0.0) };
-                let side_gap = radius - s_xy;
-                let cap_gap = half_height - c.z.abs();
-                if side_gap <= cap_gap {
-                    let surface = radial * *radius + Vec3::new(0.0, 0.0, c.z);
-                    (surface, radial, -side_gap)
-                } else {
-                    let sign = if c.z >= 0.0 { 1.0 } else { -1.0 };
-                    let surface = Vec3::new(c.x, c.y, sign * half_height);
-                    (surface, Vec3::new(0.0, 0.0, sign), -cap_gap)
-                }
-            } else {
-                // Outside: clamp to the solid cylinder.
-                let radial = if s_xy > 1e-12 { xy / s_xy } else { Vec3::zeros() };
-                let surface =
-                    radial * s_xy.min(*radius) + Vec3::new(0.0, 0.0, c.z.clamp(-half_height, *half_height));
-                let delta = c - surface;
-                let dist = delta.norm();
-                if dist < 1e-12 {
-                    return None; // exactly on the surface with no direction
-                }
-                (surface, delta / dist, dist)
+            match cylinder_closest(c, *radius, *half_height, 0.0) {
+                Some(t) => t,
+                None => return None,
             }
         }
-        _ => unreachable!("round_ball_contact needs a torus/disk/cylinder"),
+        Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+            // Union of three parts: the closest surface belongs to the
+            // part with the smallest signed distance.
+            let sphere_closest = |zc: f64, r: f64| -> Option<(Vec3, Vec3, f64)> {
+                let delta = c - Vec3::new(0.0, 0.0, zc);
+                let dist = delta.norm();
+                if dist < 1e-12 {
+                    return None; // on a sphere center: degenerate
+                }
+                let out = delta / dist;
+                Some((Vec3::new(0.0, 0.0, zc) + out * r, out, dist - r))
+            };
+            let zc = 0.5 * (z1 + z2);
+            let hh = 0.5 * (z2 - z1);
+            let mut best: Option<(Vec3, Vec3, f64)> = None;
+            for cand in [
+                sphere_closest(*z1, *r1),
+                sphere_closest(*z2, *r2),
+                cylinder_closest(c, *rod_radius, hh, zc),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if best.as_ref().is_none_or(|b| cand.2 < b.2) {
+                    best = Some(cand);
+                }
+            }
+            match best {
+                Some(t) => t,
+                None => return None,
+            }
+        }
+        _ => unreachable!("round_ball_contact needs a torus/disk/cylinder/dumbbell"),
     };
 
     let sep = sdf - r;
@@ -1378,6 +1573,59 @@ mod tests {
         assert!((g.depth - 0.01).abs() < 1e-9);
         assert!((g.point.y - 0.5).abs() < 1e-9 && (g.point.z - 0.5).abs() < 1e-9,
             "contact at the cap center, got {:?}", g.point);
+    }
+
+    #[test]
+    fn dumbbell_wall_gaps_and_ball_contacts_are_exact() {
+        // Asymmetric dumbbell (m1 = 1, m2 = 2): z1 = −9/14, z2 = 5/14.
+        let (mass, db) = boundary::dumbbell(1.0, 2.0, 0.5, 0.25, 0.25, 0.1, 1.0).unwrap();
+        let mk = |pos: Vec3, q: Quat| {
+            let mut o = physical_object::new_from_shape(
+                0,
+                mass,
+                0.0,
+                pos,
+                Vec3::zeros(),
+                Vec3::zeros(),
+                db,
+            );
+            o.set_orientation(q);
+            o
+        };
+        let (z1, z2, r1, r2) = match db {
+            Boundary::Dumbbell { r1, r2, z1, z2, .. } => (z1, z2, r1, r2),
+            _ => unreachable!(),
+        };
+
+        // Wall slab with inner face at x = 2; dumbbell axis along +x.
+        let slab = cuboid(9, 1.0, [1.0, 4.0, 4.0], Vec3::new(3.0, 0.0, 0.0));
+        let q_x = Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), std::f64::consts::FRAC_PI_2);
+        // Heavy-end-forward (local +z → world +x): gap = 2 − (z2 + r2).
+        let heavy = mk(Vec3::zeros(), q_x);
+        let sep = pair_separation(&heavy, &slab);
+        assert!((sep - (2.0 - (z2 + r2))).abs() < 1e-12, "heavy end gap {sep}");
+        // Light-end-forward (axis flipped): gap = 2 − (|z1| + r1).
+        let q_flip = Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), -std::f64::consts::FRAC_PI_2);
+        let light = mk(Vec3::zeros(), q_flip);
+        let sep2 = pair_separation(&light, &slab);
+        assert!((sep2 - (2.0 - (-z1 + r1))).abs() < 1e-12, "light end gap {sep2}");
+        // The COM sits nearer the HEAVY sphere, so the light end pokes
+        // out farther (|z1| > |z2|) and leaves the SMALLER wall gap.
+        assert!(sep2 < sep, "light-end-forward closes the gap: {sep2} vs {sep}");
+
+        // Ball against sphere-2's pole (exact SDF tier).
+        let upright = mk(Vec3::zeros(), Quat::identity());
+        let ball = sphere(1, 1.0, 0.2, Vec3::new(0.0, 0.0, z2 + r2 + 0.15));
+        assert!((pair_separation(&upright, &ball) + 0.05).abs() < 1e-12, "penetrating 0.05");
+        let g = contact_geometry(&upright, &ball, 0.0).expect("pole contact");
+        assert!((g.normal - Vec3::new(0.0, 0.0, 1.0)).norm() < 1e-12);
+        assert!((g.depth - 0.05).abs() < 1e-12);
+        // Ball against the rod's side.
+        let mid = 0.5 * (z1 + z2);
+        let side = sphere(2, 1.0, 0.2, Vec3::new(0.25, 0.0, mid));
+        assert!((pair_separation(&upright, &side) - (0.15 - 0.2)).abs() < 1e-12);
+        let gs = contact_geometry(&upright, &side, 0.0).expect("rod side contact");
+        assert!((gs.normal - Vec3::new(1.0, 0.0, 0.0)).norm() < 1e-12);
     }
 
     #[test]

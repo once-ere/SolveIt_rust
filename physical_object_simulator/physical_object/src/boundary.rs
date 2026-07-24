@@ -53,6 +53,64 @@ pub enum Boundary {
     /// A solid cylinder about the local z axis: `radius` and
     /// `half_height` (the full height is `2 · half_height`).
     Cylinder { radius: f64, half_height: f64 },
+    /// A rigid dumbbell about the local z axis: solid sphere 1
+    /// (radius `r1`, mass fraction `f1`) centered at `(0, 0, z1)`,
+    /// solid sphere 2 (radius `r2`, fraction `f2`) at `(0, 0, z2)`,
+    /// connected by a solid rod of radius `rod_radius` spanning
+    /// `z1..z2` (fraction `1 − f1 − f2`). The offsets satisfy the
+    /// center-of-mass identity `f1·z1 + f2·z2 + f_rod·(z1+z2)/2 = 0`,
+    /// so the body-frame origin is the COM — build one with
+    /// [`dumbbell`], which computes `z1`, `z2` and the fractions from
+    /// the part masses and the center-to-center length.
+    Dumbbell { r1: f64, r2: f64, rod_radius: f64, z1: f64, z2: f64, f1: f64, f2: f64 },
+}
+
+/// Builds a [`Boundary::Dumbbell`] from part masses and geometry:
+/// sphere 1 (mass `m1`, radius `r1`) and sphere 2 (`m2`, `r2`) with
+/// centers `length` apart, joined by a rod of mass `m_rod` and radius
+/// `rod_radius`. Returns `(total_mass, boundary)` with the offsets
+/// placed so the local origin is the center of mass
+/// (`z1 = −(m2 + m_rod/2)·L/M`, `z2 = (m1 + m_rod/2)·L/M`).
+pub fn dumbbell(
+    m1: f64,
+    m2: f64,
+    m_rod: f64,
+    r1: f64,
+    r2: f64,
+    rod_radius: f64,
+    length: f64,
+) -> Result<(f64, Boundary), String> {
+    let pos = |name: &str, v: f64| -> Result<(), String> {
+        if v.is_finite() && v > 0.0 {
+            Ok(())
+        } else {
+            Err(format!("dumbbell: {name} must be a finite number > 0, got {v}"))
+        }
+    };
+    pos("m1", m1)?;
+    pos("m2", m2)?;
+    if !(m_rod.is_finite() && m_rod >= 0.0) {
+        return Err(format!("dumbbell: m_rod must be a finite number >= 0, got {m_rod}"));
+    }
+    pos("r1", r1)?;
+    pos("r2", r2)?;
+    pos("rod_radius", rod_radius)?;
+    pos("length", length)?;
+    let mass = m1 + m2 + m_rod;
+    let z1 = -(m2 + 0.5 * m_rod) * length / mass;
+    let z2 = (m1 + 0.5 * m_rod) * length / mass;
+    Ok((
+        mass,
+        Boundary::Dumbbell {
+            r1,
+            r2,
+            rod_radius,
+            z1,
+            z2,
+            f1: m1 / mass,
+            f2: m2 / mass,
+        },
+    ))
 }
 
 impl Sdf for Boundary {
@@ -94,6 +152,21 @@ impl Sdf for Boundary {
                 let ox = dx.max(0.0);
                 let oz = dz.max(0.0);
                 dx.max(dz).min(0.0) + (ox * ox + oz * oz).sqrt()
+            }
+            Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+                // Union of the three parts: exact min of their SDFs.
+                let p = *local_point;
+                let sphere = |zc: f64, r: f64| {
+                    (p.x * p.x + p.y * p.y + (p.z - zc) * (p.z - zc)).sqrt() - r
+                };
+                let rho = (p.x * p.x + p.y * p.y).sqrt();
+                let zc = 0.5 * (z1 + z2);
+                let hh = 0.5 * (z2 - z1);
+                let dx = rho - rod_radius;
+                let dz = (p.z - zc).abs() - hh;
+                let (ox, oz) = (dx.max(0.0), dz.max(0.0));
+                let rod = dx.max(dz).min(0.0) + (ox * ox + oz * oz).sqrt();
+                sphere(*z1, *r1).min(sphere(*z2, *r2)).min(rod)
             }
         }
     }
@@ -143,15 +216,34 @@ pub fn analytic_inertia_tensor(mass: f64, boundary: &Boundary) -> Mat3 {
             let ixy = mass * (3.0 * r2 + 4.0 * h * h) / 12.0;
             Mat3([[ixy, 0.0, 0.0], [0.0, ixy, 0.0], [0.0, 0.0, iz]])
         }
+        Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, f1, f2 } => {
+            // Exact composite: spheres (⅖ m r² each, parallel-axis
+            // m z² off-axis) + rod (cylinder about its own center,
+            // parallel-axis about the COM). The mass fractions stored
+            // in the variant recover the part masses from the total.
+            let m1 = f1 * mass;
+            let m2 = f2 * mass;
+            let mr = (1.0 - f1 - f2) * mass;
+            let rod_len = z2 - z1;
+            let zc = 0.5 * (z1 + z2);
+            let iz = 0.4 * m1 * r1 * r1 + 0.4 * m2 * r2 * r2 + 0.5 * mr * rod_radius * rod_radius;
+            let ixy = 0.4 * m1 * r1 * r1
+                + m1 * z1 * z1
+                + 0.4 * m2 * r2 * r2
+                + m2 * z2 * z2
+                + mr * (3.0 * rod_radius * rod_radius + rod_len * rod_len) / 12.0
+                + mr * zc * zc;
+            Mat3([[ixy, 0.0, 0.0], [0.0, ixy, 0.0], [0.0, 0.0, iz]])
+        }
     }
 }
 
-/// Half-extent of the boundary along a **unit** direction `u` given in
-/// the body frame — the support function `h(u) = max_{x∈B} x·u` of the
-/// shape (for the torus this is the support of its convex hull, since a
-/// support function cannot see the hole). Exact closed forms for every
-/// variant; every shape here is centrally symmetric, so the extent
-/// along `−u` equals the extent along `+u`.
+/// The **directed** support function `h(u) = max_{x∈B} x·u` of the
+/// shape along a **unit** body-frame direction `u` (for the torus this
+/// is the support of its convex hull, since a support function cannot
+/// see the hole). Exact closed forms for every variant. All shapes
+/// except the dumbbell are centrally symmetric (`h(−u) = h(u)`); the
+/// dumbbell's off-center spheres make it genuinely directed.
 pub fn support_extent(boundary: &Boundary, u: Vec3) -> f64 {
     let s_xy = (u.x * u.x + u.y * u.y).sqrt();
     match boundary {
@@ -163,6 +255,14 @@ pub fn support_extent(boundary: &Boundary, u: Vec3) -> f64 {
         Boundary::Torus { ring_radius, tube_radius } => ring_radius * s_xy + tube_radius,
         Boundary::Disk { radius } => radius * s_xy,
         Boundary::Cylinder { radius, half_height } => radius * s_xy + half_height * u.z.abs(),
+        Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+            let s1 = z1 * u.z + r1;
+            let s2 = z2 * u.z + r2;
+            let zc = 0.5 * (z1 + z2);
+            let hh = 0.5 * (z2 - z1);
+            let rod = zc * u.z + rod_radius * s_xy + hh * u.z.abs();
+            s1.max(s2).max(rod)
+        }
     }
 }
 
@@ -200,6 +300,23 @@ pub fn support_point(boundary: &Boundary, u: Vec3) -> Vec3 {
         Boundary::Disk { radius } => radial * *radius,
         Boundary::Cylinder { radius, half_height } => {
             radial * *radius + Vec3::new(0.0, 0.0, half_height * sg(u.z))
+        }
+        Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+            // The part achieving the directed support (ties go to the
+            // spheres; the rod's supporting set centroid mirrors the
+            // cylinder convention).
+            let s1 = z1 * u.z + r1;
+            let s2 = z2 * u.z + r2;
+            let zc = 0.5 * (z1 + z2);
+            let hh = 0.5 * (z2 - z1);
+            let rod = zc * u.z + rod_radius * s_xy + hh * u.z.abs();
+            if s1 >= s2 && s1 >= rod {
+                Vec3::new(0.0, 0.0, *z1) + u * *r1
+            } else if s2 >= rod {
+                Vec3::new(0.0, 0.0, *z2) + u * *r2
+            } else {
+                radial * *rod_radius + Vec3::new(0.0, 0.0, zc + hh * sg(u.z))
+            }
         }
     }
 }
@@ -252,6 +369,10 @@ pub fn support_rank(boundary: &Boundary, u: Vec3) -> u8 {
                 0 // rim point
             }
         }
+        // A sphere end supports at a single point in every generic
+        // direction (side-on the rod could support a line, but a
+        // sphere always ties or beats it at the ends).
+        Boundary::Dumbbell { .. } => 0,
     }
 }
 
@@ -302,6 +423,7 @@ pub fn support_footprint_radius(boundary: &Boundary, u: Vec3) -> f64 {
                 0.0
             }
         }
+        Boundary::Dumbbell { .. } => 0.0, // sphere-end point support
     }
 }
 
@@ -318,6 +440,12 @@ pub fn bounding_radius(boundary: &Boundary) -> f64 {
         Boundary::Disk { radius } => *radius,
         Boundary::Cylinder { radius, half_height } => {
             (radius * radius + half_height * half_height).sqrt()
+        }
+        Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+            let zmax = z1.abs().max(z2.abs());
+            (z1.abs() + r1)
+                .max(z2.abs() + r2)
+                .max((rod_radius * rod_radius + zmax * zmax).sqrt())
         }
     }
 }
@@ -407,6 +535,66 @@ mod tests {
 
         assert!((bounding_radius(&t) - 2.0).abs() < 1e-15);
         assert!((bounding_radius(&Boundary::Cylinder { radius: 3.0, half_height: 4.0 }) - 5.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn dumbbell_constructor_com_sdf_and_supports() {
+        // m1 = 1, m2 = 2, m_rod = 0.5, r1 = r2 = 0.25, rod_r = 0.1, L = 1.
+        let (mass, b) = dumbbell(1.0, 2.0, 0.5, 0.25, 0.25, 0.1, 1.0).expect("valid");
+        assert_eq!(mass, 3.5);
+        let (r1, r2, rod_radius, z1, z2, f1, f2) = match b {
+            Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, f1, f2 } => {
+                (r1, r2, rod_radius, z1, z2, f1, f2)
+            }
+            other => panic!("expected a dumbbell, got {other:?}"),
+        };
+        // z1 = −(2 + 0.25)/3.5, z2 = (1 + 0.25)/3.5, length preserved.
+        assert!((z1 + 2.25 / 3.5).abs() < 1e-15);
+        assert!((z2 - 1.25 / 3.5).abs() < 1e-15);
+        assert!((z2 - z1 - 1.0).abs() < 1e-15, "center-to-center length");
+        // The COM identity: m1 z1 + m2 z2 + m_rod (z1+z2)/2 = 0.
+        let com = 1.0 * z1 + 2.0 * z2 + 0.5 * 0.5 * (z1 + z2);
+        assert!(com.abs() < 1e-15, "COM at the origin, got {com}");
+        assert!((f1 - 1.0 / 3.5).abs() < 1e-15 && (f2 - 2.0 / 3.5).abs() < 1e-15);
+
+        // SDF: at sphere-2's outer pole, on the rod side, in free space.
+        assert!(b.signed_distance(&Vec3::new(0.0, 0.0, z2 + r2)).abs() < 1e-15);
+        assert!((b.signed_distance(&Vec3::new(0.0, 0.0, z1 - r1 - 0.1)) - 0.1).abs() < 1e-15);
+        let mid = 0.5 * (z1 + z2);
+        assert!((b.signed_distance(&Vec3::new(0.3, 0.0, mid)) - (0.3 - rod_radius)).abs() < 1e-15);
+        assert!(b.signed_distance(&Vec3::new(0.0, 0.0, mid)) < 0.0, "inside the rod");
+
+        // Directed supports: the two ends genuinely differ.
+        let ez = Vec3::new(0.0, 0.0, 1.0);
+        assert!((support_extent(&b, ez) - (z2 + r2)).abs() < 1e-15);
+        assert!((support_extent(&b, -ez) - (-z1 + r1)).abs() < 1e-15);
+        assert!(support_extent(&b, ez) != support_extent(&b, -ez), "asymmetric body");
+        // Support points achieve their extents in mixed directions too.
+        for u in [ez, -ez, Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.6, -0.3, 0.74).normalize()] {
+            let p = support_point(&b, u);
+            assert!(
+                (p.dot(u) - support_extent(&b, u)).abs() < 1e-12,
+                "support point along {u:?}"
+            );
+        }
+
+        // Inertia: the exact composite, checked against hand numbers.
+        let i = analytic_inertia_tensor(mass, &b);
+        let iz = 0.4 * 1.0 * 0.0625 + 0.4 * 2.0 * 0.0625 + 0.5 * 0.5 * 0.01;
+        assert!((i.0[2][2] - iz).abs() < 1e-15, "Iz");
+        let ixy = 0.4 * 1.0 * 0.0625
+            + 1.0 * z1 * z1
+            + 0.4 * 2.0 * 0.0625
+            + 2.0 * z2 * z2
+            + 0.5 * (3.0 * 0.01 + 1.0) / 12.0
+            + 0.5 * mid * mid;
+        assert!((i.0[0][0] - ixy).abs() < 1e-14, "Ixy: {} vs {ixy}", i.0[0][0]);
+        assert!((i.0[1][1] - ixy).abs() < 1e-14);
+
+        // Invalid inputs are refused with actionable messages.
+        assert!(dumbbell(0.0, 1.0, 0.1, 0.2, 0.2, 0.1, 1.0).is_err());
+        assert!(dumbbell(1.0, 1.0, -0.1, 0.2, 0.2, 0.1, 1.0).is_err());
+        assert!(dumbbell(1.0, 1.0, 0.1, 0.2, 0.2, 0.1, 0.0).is_err());
     }
 
     #[test]

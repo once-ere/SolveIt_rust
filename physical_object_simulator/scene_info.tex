@@ -81,8 +81,10 @@ showing 4 entities; SCENE START begins the evolution - HELP lists all scene comm
 \end{lstlisting}
 
 The window shows \textbf{all simulator entities} (points, spheres,
-cuboids, tori, disks, cylinders), a ground grid, the world axes,
-motion trails, and object labels. If the notebook created a rigid
+cuboids, tori, disks, cylinders, dumbbells), a ground grid, the world
+axes, motion trails, and object labels (an object registered with
+\kw{new} \code{...} \kw{as} \code{<name>} is labeled by that name).
+If the notebook created a rigid
 bounding box (\kw{box} \code{<size>}), the window draws its interior
 as a dashed light-blue wireframe --- the six infinitely-massive wall
 slabs that implement it are represented by that wireframe, never
@@ -104,6 +106,7 @@ Start & begin time-stepped evolution, forward in time\\
 Pause & freeze the evolution (resume with Start)\\
 Stop & halt evolution \emph{and clear the recorded history}\\
 Reverse & play \textbf{backward} through the recorded history\\
+Reset & re-initialize the playback: \textbf{every value and the time return to their initial values}; Start then runs the simulation again from the beginning\\
 step back / step & single step backward / forward\\
 dt \code{\_\_\_\_} Set & change the playback time step\\
 zoom + / zoom -- & zoom in / out\\
@@ -113,6 +116,18 @@ Contacts & toggle contact-normal arrows drawn at collision points\\
 ? & show the controls cheat-sheet\\
 \end{tabular}
 \end{center}
+
+\subsection{The ``conserved quantities'' readout (top-left)}
+
+A permanent labeled overlay (just below the toolbar) shows the three
+conserved quantities of the playback copy, updated live at every
+frame: \textbf{E} (total energy), \textbf{P} (total linear momentum)
+and \textbf{L} (total angular momentum about the origin). P and L are
+printed as their three components plus the magnitude \code{|.|}.
+Watching E, P and L sit still through a collision \emph{is} the
+physics lesson --- the values come straight from the frame protocol's
+\code{energy}, \code{p} and \code{l} fields (\S5.1), computed on the
+playback copy every tick.
 
 \subsection{The status bar (bottom of the window)}
 
@@ -373,6 +388,7 @@ All keywords are case-insensitive. Numeric arguments are
 \kw{scene stop} & Halt evolution and clear the recorded history.\\
 \kw{scene pause} & Freeze evolution; \kw{scene start} resumes, history kept.\\
 \kw{scene reverse} & Play \textbf{backward in time} through the recorded history; pauses automatically at the beginning. Errors if no history exists yet.\\
+\kw{scene reset} & Re-initialize the playback: \textbf{every mutable value and the time return to their initial values} --- the state last synced at \kw{scene create}/\kw{scene refresh} --- bit-identically; history and the step counter clear and the mode returns to Stopped. \kw{scene start} (or the window's Start button) then re-runs the simulation from the beginning. The toolbar \textbf{Reset} button calls the very same primitive.\\
 \kw{scene set\_time\_step} \code{dt} & Set the playback time step (must be positive and finite).\\
 \kw{scene status} & Report URL, connected windows, mode, t, dt, steps, history size, entities, hidden list, camera.\\
 \kw{scene events} & Drain and print the asynchronous window~$\to$~notebook event queue.\\
@@ -394,6 +410,12 @@ Notes for the curious:
 \item \kw{reset} in the notebook keeps the window open and re-syncs
       it to the now-empty system --- including clearing the box
       wireframe and wall flags if a \kw{box} existed.
+\item \kw{scene reset} is \textbf{not} the notebook's \kw{reset}:
+      the notebook command empties the system itself, while
+      \kw{scene reset} only rewinds the window's playback copy to the
+      state it was last synced with. The reply spells it out:
+      \code{scene playback reset to its initial state (t = 0, 1
+      entity); Start runs the simulation again from the beginning}.
 \end{itemize}
 
 \section{The wire protocol (WebSocket, JSON text frames)}
@@ -411,8 +433,9 @@ document per frame, both directions.
              {"i":3,"mass":2.0,"charge":0.0,"shape":"cuboid",
               "half_extents":[0.3,0.2,0.1]}]}
 \end{lstlisting}
-Sent on connect, on \kw{scene refresh}/\kw{redraw}, and after
-hide/show. Geometry travels \textbf{once} (the Rapier idea). Note
+Sent on connect, on \kw{scene refresh}/\kw{redraw}, after hide/show,
+and after a playback reset (\kw{scene reset} / the Reset button).
+Geometry travels \textbf{once} (the Rapier idea). Note
 that \kw{box} \code{<size>} / \kw{box off} in the notebook do
 \textbf{not} push a new init on their own --- box changes reach an
 open window only via \kw{scene refresh}, and the \kw{box} reply
@@ -421,17 +444,26 @@ The one exception is \kw{reset}, which re-syncs the window itself and
 clears the box wireframe and wall flags automatically.
 
 Each entity carries its shape-specific geometry: a \code{sphere} its
-\code{radius}, a \code{cuboid} its \code{half\_extents}, and --- new
-in the shapes-and-box release --- a \code{torus} its
-\code{ring\_radius} and \code{tube\_radius}, a \code{disk} its
-\code{radius}, a \code{cylinder} its \code{radius} and
-\code{half\_height}:
+\code{radius}, a \code{cuboid} its \code{half\_extents}, a
+\code{torus} its \code{ring\_radius} and \code{tube\_radius}, a
+\code{disk} its \code{radius}, a \code{cylinder} its \code{radius}
+and \code{half\_height}, and --- new in the dumbbell release --- a
+\code{dumbbell} its two sphere radii \code{r1}/\code{r2}, its
+\code{rod\_radius}, and the sphere-centre offsets
+\code{z1}/\code{z2} along the local axis (the local origin is the
+composite COM, so the offsets are mass-weighted and unequal). Any
+entity whose object was registered with \kw{new} \code{...} \kw{as}
+\code{<name>} also carries \code{"name"} --- the window prefers it
+over \code{objN} for the label:
 
 \begin{lstlisting}
 {"i":6,"mass":1.0,"charge":0.0,"shape":"torus","ring_radius":1.5,"tube_radius":0.5}
 {"i":9,"mass":0.6666666666666666,"charge":0.0,"shape":"disk","radius":1.0}
 {"i":11,"mass":2.0,"charge":0.0,"shape":"cylinder","radius":0.5,"half_height":0.75}
 {"i":0,"mass":0.0,"charge":0.0,"shape":"cuboid","half_extents":[1.0,4.0,4.0],"wall":true}
+{"i":0,"mass":3.5,"charge":0.0,"shape":"dumbbell","r1":0.25,"r2":0.25,
+ "rod_radius":0.1,"z1":-0.6428571428571429,"z2":0.35714285714285715,
+ "name":"dumbell0"}
 \end{lstlisting}
 
 Two optional fields describe the rigid bounding box: each of the six
@@ -442,7 +474,8 @@ when no box exists.
 
 \begin{lstlisting}
 {"type":"frame","t":1.234,"dt":0.002,"mode":"running","steps":617,
- "history":617,"energy":-592.49,"hidden":[],
+ "history":617,"energy":-592.49,
+ "p":[0.15,0.0,0.0],"l":[0.4443,0.0,-1.506],"hidden":[],
  "contacts":[{"i":0,"j":1,"point":[0,0,0],"normal":[1,0,0],"impulse":2.0}],
  "bodies":[[x,y,z,qw,qx,qy,qz], ...]}
 \end{lstlisting}
@@ -459,6 +492,13 @@ Verified live: a head-on elastic impact broadcasts
 exact analytic values --- and the arrow renders at the projected
 contact point.
 
+Alongside \code{energy}, every frame now carries the other two
+conserved totals, computed on the playback copy every tick: \code{p}
+is the \textbf{total linear momentum} and \code{l} the \textbf{total
+angular momentum about the origin} (each \code{[x,y,z]}). These are
+exactly the numbers the ``conserved quantities'' readout (\S1.2)
+displays.
+
 \begin{lstlisting}
 {"type":"camera","camera":{"yaw":...,"pitch":...,"dist":...,"target":[...]}}
 \end{lstlisting}
@@ -469,7 +509,7 @@ Sent when the \emph{notebook} moves the camera
 
 \begin{lstlisting}
 {"type":"cmd","action":"start"}                  // toolbar buttons:
-   // start | pause | stop | reverse | step | step_back | set_dt | refresh
+   // start | pause | stop | reverse | reset | step | step_back | set_dt | refresh
 {"type":"cmd","action":"set_dt","value":0.005}
 {"type":"camera","yaw":-92,"pitch":71,"dist":7.9,"target":[0,0,0]}
    // gesture sync, throttled to 10 Hz, so SCENE STATUS matches the screen
@@ -522,6 +562,35 @@ posim process
       tube cross-sections --- enough to read the hole and the spin; a
       \textbf{disk} is its rim plus two diameters; a
       \textbf{cylinder} is its two cap rims plus four side lines.
+\item \textbf{The dumbbell renderer} --- a \textbf{dumbbell} is drawn
+      as one rigid body: two radial-gradient-shaded spheres (radii
+      \code{r1}, \code{r2}) at their COM offsets \code{z1}, \code{z2}
+      rotated by the body quaternion, joined by the rod's
+      \textbf{four silhouette lines} (the lines between the sphere
+      centres, offset radially by \code{rod\_radius} in four
+      directions). Because the offsets are mass-weighted the heavier
+      end sits closer to the drawn position --- the spin and the
+      asymmetry are both visible.
+\item \textbf{The conserved-quantities readout} --- a permanent
+      labeled overlay (\code{id="hud"}, top-left under the toolbar)
+      rebuilt on every frame from the frame message's \code{energy},
+      \code{p} and \code{l} fields: an \code{E} line (8 digits) and
+      \code{P}/\code{L} lines showing the three components plus the
+      \code{|.|} magnitude (5 digits). Entity labels, drawn in the
+      body pass, prefer the init entity's \code{"name"} (the user's
+      \kw{new} \code{...} \kw{as} registration) and fall back to
+      \code{objN}.
+\item \textbf{\code{Shared.initial} + \code{reset\_playback}} --- the
+      playback state keeps an \code{initial} snapshot: the system as
+      last synced from the notebook (set at \kw{scene create} and by
+      every \kw{scene refresh}/\kw{reset} re-sync).
+      \code{reset\_playback} restores it as a bit-identical clone ---
+      every mutable value and the time return to their initial
+      values --- clears the history ring and the step counter,
+      returns the mode to Stopped, and flags a fresh init for every
+      window. Three doors, one primitive: the toolbar \textbf{Reset}
+      button, the window's \code{reset} command, and the notebook's
+      \kw{scene reset} all land in the same function.
 \item \textbf{The rigid bounding box} --- when the init message
       carries \code{"box"}, the page strokes the interior cube as a
       dashed \code{\#5d84a8} wireframe (12 edges, drawn just after
@@ -641,6 +710,54 @@ the \kw{box} command (the workspace suite is now 94 tests: 37 lib +
       golden contact arrows (2{,}218 pixels); toolbar Start and
       Reverse were exercised through real DOM clicks; the JS console
       stayed free of errors.
+\end{itemize}
+
+\textbf{Reset + conserved-quantities release (2026-07-24).} The
+workspace suite is now \textbf{99 tests: 39 lib + 16 collision + 9
+conservation + 35 posim}, zero warnings. What the new layers pin
+down:
+
+\begin{itemize}
+\item \textbf{Reset is a true re-initialization.} The posim test
+      \code{reset\_restores\_the\_initial\_state\_and\_start\_reruns}
+      runs the playback forward ($\geq 10$ steps), calls the reset
+      primitive, and asserts the mode is Stopped, the time is back to
+      its initial value, the packed 13-per-object state is
+      \textbf{bit-identical} to the initial pack, and the step
+      counter is 0 --- then sets Running again and asserts the
+      simulation re-starts. The page-serve test additionally asserts
+      the permanent \code{id="bt-reset"} button is in the served
+      HTML, and \code{scene\_commands\_compile} covers
+      \kw{scene reset}.
+\item \textbf{Reset verified live.} In a real browser session the
+      demo was run to $t = 0.72$, the toolbar Reset was clicked: mode
+      \code{stopped}, $t = 0$, history $= 0$, and the body's state
+      bit-identically back at its start values; clicking Start then
+      set the window running again from the beginning.
+\item \textbf{The protocol carries the new fields.} The WebSocket
+      session test (\code{websocket\_session\_end\_to\_end}) asserts
+      every broadcast frame contains \code{"p":[} and \code{"l":[};
+      \code{box\_shapes\_and\_wall\_flags\_reach\_the\_init\_message}
+      asserts the init JSON carries the registered user name
+      (\code{"name":"ringo"}).
+\item \textbf{The dumbbell demo, live.} The two-dumbbell collision
+      demo (\code{scripts/collisions/12\_two\_dumbbells.posim} ---
+      two user-named dumbbells built by a user-defined function,
+      colliding off-center with spin) was played back in a real
+      browser window: the entity labels read \code{dumbell0} and
+      \code{dumbell1}, and the conserved-quantities readout showed
+\begin{lstlisting}
+E = 7.86531061, P = [0.15000, 0.00000, 0.00000] |.| = 0.15000, L = [0.44430, 0.00000, -1.50600] |.| = 1.57017
+\end{lstlisting}
+      \textbf{identically before and after the impact} (L's $y$
+      component showed \code{-1.31228e-13} after ---
+      machine-epsilon noise). The notebook run of the same script
+      reports, through 2 real CVODE collision events,
+\begin{lstlisting}
+t = 3 (3861 solver steps, 60 snapshots, |dE/E| = 9.463e-11, 2 collision(s) — CONTACTS lists them)
+\end{lstlisting}
+      with the total momentum \code{[0.15000000000000036, 0, 0]}
+      \textbf{bit-identical} before and after.
 \end{itemize}
 
 \section{FAQ / troubleshooting}

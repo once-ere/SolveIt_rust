@@ -98,6 +98,11 @@ impl Default for Camera {
 /// (broadcasts go through non-blocking mpsc channels).
 struct Shared {
     system: PhysicalObjectSystem,
+    /// The playback copy's INITIAL state: what `SCENE CREATE` /
+    /// `SCENE REFRESH` synced. `reset_playback` restores it exactly
+    /// (every mutable value and the time), after which Start begins
+    /// the simulation afresh.
+    initial: PhysicalObjectSystem,
     mode: RunMode,
     dt: f64,
     hidden: BTreeSet<usize>,
@@ -107,6 +112,8 @@ struct Shared {
     /// Entity indices of the six static wall slabs: drawn as the box
     /// wireframe instead of six giant cuboids.
     walls: BTreeSet<usize>,
+    /// User names (index → name) for entity labels.
+    names: BTreeMap<usize, String>,
     camera: Camera,
     history: VecDeque<PhysicalObjectSystem>,
     events: VecDeque<String>,
@@ -157,6 +164,20 @@ impl Shared {
                 self.push_event(&format!("error: solver failed at t = {}: {e}", self.system.time));
             }
         }
+    }
+
+    /// Re-initializes the playback: every mutable value returns to its
+    /// initial value (the state last synced from the notebook) and the
+    /// time returns to its initial value — a bit-identical clone of
+    /// the `initial` snapshot. History and the step counter clear and
+    /// the mode returns to Stopped; the Start button then re-starts
+    /// the simulation from the beginning.
+    fn reset_playback(&mut self) {
+        self.system = self.initial.clone();
+        self.history.clear();
+        self.steps_done = 0;
+        self.mode = RunMode::Stopped;
+        self.needs_init = true;
     }
 
     /// Steps one recorded frame backward; pauses at the beginning.
@@ -226,9 +247,20 @@ fn build_init(sh: &Shared) -> String {
                 m.insert("radius".to_string(), Json::Num(radius));
                 m.insert("half_height".to_string(), Json::Num(half_height));
             }
+            Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+                m.insert("shape".to_string(), Json::Str("dumbbell".to_string()));
+                m.insert("r1".to_string(), Json::Num(r1));
+                m.insert("r2".to_string(), Json::Num(r2));
+                m.insert("rod_radius".to_string(), Json::Num(rod_radius));
+                m.insert("z1".to_string(), Json::Num(z1));
+                m.insert("z2".to_string(), Json::Num(z2));
+            }
         }
         if sh.walls.contains(&i) {
             m.insert("wall".to_string(), Json::Bool(true));
+        }
+        if let Some(n) = sh.names.get(&i) {
+            m.insert("name".to_string(), Json::Str(n.clone()));
         }
         ents.push(Json::Obj(m));
     }
@@ -289,6 +321,18 @@ fn build_frame(sh: &Shared) -> String {
     m.insert("steps".to_string(), Json::Num(sh.steps_done as f64));
     m.insert("history".to_string(), Json::Num(sh.history.len() as f64));
     m.insert("energy".to_string(), Json::Num(sh.system.total_energy()));
+    let ptot = sh.system.total_momentum();
+    let ltot = sh.system.total_angular_momentum(
+        ::physical_object::linalg::Vec3::zeros(),
+    );
+    m.insert(
+        "p".to_string(),
+        Json::Arr(vec![Json::Num(ptot.x), Json::Num(ptot.y), Json::Num(ptot.z)]),
+    );
+    m.insert(
+        "l".to_string(),
+        Json::Arr(vec![Json::Num(ltot.x), Json::Num(ltot.y), Json::Num(ltot.z)]),
+    );
     m.insert("hidden".to_string(), hidden_json(&sh.hidden));
     m.insert("contacts".to_string(), Json::Arr(contacts));
     m.insert("bodies".to_string(), Json::Arr(bodies));
@@ -341,12 +385,14 @@ impl SceneHandle {
         let mut camera = Camera::default();
         camera.dist = fit_distance(&system);
         let shared = Arc::new(Mutex::new(Shared {
+            initial: system.clone(),
             system,
             mode: RunMode::Stopped,
             dt: 0.01,
             hidden: BTreeSet::new(),
             box_size: None,
             walls: BTreeSet::new(),
+            names: BTreeMap::new(),
             camera,
             history: VecDeque::new(),
             events: VecDeque::new(),
@@ -434,10 +480,28 @@ impl SceneHandle {
     pub fn sync(&self, system: &PhysicalObjectSystem) -> Result<(), String> {
         let mut sh = self.lock()?;
         sh.system = system.clone();
+        /* the synced state becomes the new "initial values" that the
+         * Reset button / SCENE RESET restore */
+        sh.initial = system.clone();
         sh.history.clear();
         sh.steps_done = 0;
         sh.needs_init = true;
         Ok(())
+    }
+
+    /// Re-initializes the playback to its initial state (see
+    /// `Shared::reset_playback`) — the `SCENE RESET` command and the
+    /// window's Reset button both land here.
+    pub fn reset_playback(&self) -> Result<String, String> {
+        let mut sh = self.lock()?;
+        sh.reset_playback();
+        Ok(format!(
+            "scene playback reset to its initial state (t = {}, {} entit{}); \
+             Start runs the simulation again from the beginning",
+            sh.system.time,
+            sh.system.objects.len(),
+            if sh.system.objects.len() == 1 { "y" } else { "ies" }
+        ))
     }
 
     /// Forces a full scene re-description on every window.
@@ -447,13 +511,19 @@ impl SceneHandle {
         Ok(())
     }
 
-    /// Tells the window about the rigid bounding box: its inner size
-    /// (None = no box) and the entity indices of the six wall slabs
-    /// (drawn as the box's interior wireframe, not as giant cuboids).
-    pub fn set_box(&self, box_size: Option<f64>, walls: &[usize]) -> Result<(), String> {
+    /// Tells the window about the rigid bounding box (inner size, wall
+    /// slab indices — drawn as the interior wireframe, not as giant
+    /// cuboids) and the user-name registry for entity labels.
+    pub fn set_box(
+        &self,
+        box_size: Option<f64>,
+        walls: &[usize],
+        names: &std::collections::BTreeMap<String, usize>,
+    ) -> Result<(), String> {
         let mut sh = self.lock()?;
         sh.box_size = box_size;
         sh.walls = walls.iter().copied().collect();
+        sh.names = names.iter().map(|(n, i)| (*i, n.clone())).collect();
         sh.needs_init = true;
         Ok(())
     }
@@ -600,6 +670,24 @@ impl SceneHandle {
     #[cfg(test)]
     pub fn mode(&self) -> RunMode {
         self.lock().map(|sh| sh.mode).unwrap_or(RunMode::Stopped)
+    }
+
+    /// Forward steps taken by the playback copy (used in tests).
+    #[cfg(test)]
+    pub fn steps_done(&self) -> u64 {
+        self.lock().map(|sh| sh.steps_done).unwrap_or(0)
+    }
+
+    /// The playback copy's simulation time (used in tests).
+    #[cfg(test)]
+    pub fn system_time(&self) -> f64 {
+        self.lock().map(|sh| sh.system.time).unwrap_or(f64::NAN)
+    }
+
+    /// The playback copy's packed 13N state (used in tests).
+    #[cfg(test)]
+    pub fn packed_state(&self) -> Vec<f64> {
+        self.lock().map(|sh| sh.system.pack_state()).unwrap_or_default()
     }
 }
 
@@ -809,6 +897,7 @@ fn handle_client_message(sh: &mut Shared, text: &str, own_tx: &Sender<String>) {
                 }
                 "step" => sh.step_forward(),
                 "step_back" => sh.step_backward(),
+                "reset" => sh.reset_playback(),
                 "set_dt" => {
                     if let Some(v) = num("value") {
                         if v.is_finite() && v > 0.0 {
@@ -920,6 +1009,7 @@ mod tests {
         assert!(body.contains("id=\"statusbar\""), "statusbar missing");
         /* collision UI: normal-arrow toggle + statusbar counter */
         assert!(body.contains("id=\"bt-contacts\""), "Contacts toggle missing");
+        assert!(body.contains("id=\"bt-reset\""), "permanent Reset button missing");
         assert!(body.contains("id=\"st-contacts\""), "contacts statusbar missing");
         /* the three required gestures are wired in the page script */
         assert!(body.contains("ArrowLeft") && body.contains("ArrowRight"), "arrow keys");
@@ -991,6 +1081,8 @@ mod tests {
             let msg = ws_read_text(&mut stream);
             if msg.contains("\"type\":\"frame\"") && msg.contains("\"bodies\":[") {
                 assert!(msg.contains("\"contacts\":["), "frame carries the contacts array");
+                assert!(msg.contains("\"p\":["), "frame carries total momentum");
+                assert!(msg.contains("\"l\":["), "frame carries total angular momentum");
                 saw_frame = true;
                 break;
             }
@@ -1024,7 +1116,13 @@ mod tests {
             ::physical_object::boundary::Boundary::Torus { ring_radius: 1.5, tube_radius: 0.5 },
         ));
         let handle = SceneHandle::start(sys, 0, false, false).unwrap();
-        handle.set_box(Some(4.0), &[0]).unwrap();
+        handle
+            .set_box(
+                Some(4.0),
+                &[0],
+                &std::collections::BTreeMap::from([("ringo".to_string(), 1usize)]),
+            )
+            .unwrap();
 
         let mut stream = TcpStream::connect(("127.0.0.1", port_of(&handle.url))).unwrap();
         stream
@@ -1055,6 +1153,33 @@ mod tests {
         assert!(seen.contains("\"ring_radius\":1.5"), "{seen}");
         assert!(seen.contains("\"tube_radius\":0.5"), "{seen}");
         assert!(seen.contains("\"wall\":true"), "{seen}");
+        assert!(seen.contains("\"name\":\"ringo\""), "{seen}");
+    }
+
+    #[test]
+    fn reset_restores_the_initial_state_and_start_reruns() {
+        let sys = test_system();
+        let initial_pack = sys.pack_state();
+        let handle = SceneHandle::start(sys, 0, false, false).unwrap();
+        handle.set_dt(0.05).unwrap();
+        handle.set_mode(RunMode::Running).unwrap();
+        assert!(wait_for(|| handle.steps_done() >= 10), "playback advanced");
+        handle.set_mode(RunMode::Paused).unwrap();
+        assert!(handle.system_time() > 0.0, "time moved");
+
+        /* Reset: every mutable value and the time return to their
+         * initial values — bit-identically. */
+        let msg = handle.reset_playback().unwrap();
+        assert!(msg.contains("initial state"), "{msg}");
+        assert_eq!(handle.mode(), RunMode::Stopped);
+        assert_eq!(handle.system_time(), 0.0, "time back to its initial value");
+        assert_eq!(handle.packed_state(), initial_pack, "bit-identical initial state");
+        assert_eq!(handle.steps_done(), 0);
+
+        /* Start re-starts the simulation after a reset. */
+        handle.set_mode(RunMode::Running).unwrap();
+        assert!(wait_for(|| handle.steps_done() >= 5), "re-started after reset");
+        assert!(handle.system_time() > 0.0);
     }
 
     #[test]

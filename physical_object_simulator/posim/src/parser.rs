@@ -5,7 +5,10 @@
 //! Grammar (EBNF):
 //!
 //! ```text
-//! command  := "NEW" shape [ "{" init { "," init } "}" ]
+//! command  := "NEW" shape [ "AS" (IDENT | STRING) ]
+//!                          [ "{" init { "," init } "}" ]
+//!                                               (* AS registers a user
+//!                                                  name for the object *)
 //!           | "SET" path "=" expr
 //!           | "GET" path
 //!           | "DEL" NUMBER
@@ -19,6 +22,9 @@
 //!           | "SCENE" scenecmd                  (* graphical scene     *)
 //!           | "COLLIDE" [ "ON" | "OFF" ]        (* bare: report status *)
 //!           | "CONTACTS"                        (* list last contacts  *)
+//!           | "LET" IDENT "=" expr              (* session variable    *)
+//!           | "FUNCS"                           (* list user functions *)
+//!           | "SHOW" IDENT                      (* print a function    *)
 //!           | "BOX" [ "OFF" | expr ]            (* rigid bounding box:
 //!                                                  expr = inner side
 //!                                                  length; bare = status;
@@ -34,25 +40,43 @@
 //!           | "REFRESH"                         (* re-sync from state  *)
 //!           | "REDRAW"                          (* re-send full scene  *)
 //!           | "START" | "STOP" | "PAUSE" | "REVERSE"
+//!           | "RESET"                           (* re-initialize: all
+//!                                                  values and the time
+//!                                                  return to initial;
+//!                                                  START re-starts    *)
 //!           | "SET_TIME_STEP" term              (* args are term-level:
 //!                                                  -5 is negative five;
 //!                                                  parenthesize sums  *)
 //!           | "STATUS" | "EVENTS" ;
-//! shape    := "POINT" | "SPHERE" | "CUBOID" | "TORUS" | "DISK" | "CYLINDER" ;
+//! shape    := "POINT" | "SPHERE" | "CUBOID" | "TORUS" | "DISK" | "CYLINDER"
+//!           | "DUMBBELL" ;                      (* two solid spheres +
+//!                                                  a rigid rod, one
+//!                                                  rigid body          *)
+//!
+//! (* User-defined functions are a LINE FORM handled before this
+//!    grammar: DEF name(param [= default], ...) { body } — the body is
+//!    newline/;-separated commands using the parameters as variables;
+//!    each body line must itself satisfy this grammar. Invocation uses
+//!    the ordinary call syntax name(arg, ...); trailing parameters
+//!    take their defaults. *)
 //! init     := IDENT "=" expr ;
 //! path     := IDENT { "." IDENT } ;             (* objN.field[.x|y|z|w],
 //!                                                  system.field,
-//!                                                  contactK.field      *)
+//!                                                  contactK.field,
+//!                                                  name.field for
+//!                                                  AS-registered names *)
 //! expr     := term { ("+" | "-") term } ;
 //! term     := unary { ("*" | "/") unary } ;
 //! unary    := "-" unary | atom ;
-//! atom     := NUMBER | "[" expr { "," expr } "]" | "(" expr ")"
-//!           | IDENT "(" [ expr { "," expr } ] ")"   (* builtin call    *)
-//!           | path ;
+//! atom     := NUMBER | STRING | "[" expr { "," expr } "]" | "(" expr ")"
+//!           | IDENT "(" [ expr { "," expr } ] ")"   (* builtin or user
+//!                                                      function call   *)
+//!           | path
+//!           | IDENT ;                           (* parameter / LET var *)
 //! ```
 
 use crate::lexer::{tokenize, Keyword, TokKind, Token};
-use crate::vm::{Instr, MethodSpec, Path, PathRoot, ShapeKind, Value};
+use crate::vm::{Instr, MethodSpec, NameArg, Path, PathRoot, ShapeKind, Value};
 
 pub struct Parser {
     toks: Vec<Token>,
@@ -158,20 +182,44 @@ impl Parser {
                     Some(Token { kind: TokKind::Keyword(Keyword::Cylinder), .. }) => {
                         ShapeKind::Cylinder
                     }
+                    Some(Token { kind: TokKind::Keyword(Keyword::Dumbbell), .. }) => {
+                        ShapeKind::Dumbbell
+                    }
                     Some(t) => {
                         return Err(format!(
                             "parse error at column {}: expected POINT, SPHERE, CUBOID, TORUS, \
-                             DISK or CYLINDER, found {}",
+                             DISK, CYLINDER or DUMBBELL, found {}",
                             t.col, t.kind
                         ))
                     }
                     None => {
                         return Err("parse error: NEW needs a shape (POINT, SPHERE, CUBOID, \
-                                    TORUS, DISK, CYLINDER)"
+                                    TORUS, DISK, CYLINDER, DUMBBELL)"
                             .into())
                     }
                 };
                 prog.push(Instr::NewObject(shape));
+                /* optional `AS <name>`: a bare identifier (resolved
+                 * against function parameters / LET variables holding a
+                 * string, else taken literally) or a string literal */
+                let name = if self.eat_keyword(Keyword::As) {
+                    match self.next() {
+                        Some(Token { kind: TokKind::Ident(n), .. }) => {
+                            Some(NameArg::Ident(n.to_ascii_lowercase()))
+                        }
+                        Some(Token { kind: TokKind::Str(st), .. }) => Some(NameArg::Str(st)),
+                        Some(t) => {
+                            return Err(format!(
+                                "parse error at column {}: AS needs a name (identifier or \
+                                 string), found {}",
+                                t.col, t.kind
+                            ))
+                        }
+                        None => return Err("parse error: AS needs a name".into()),
+                    }
+                } else {
+                    None
+                };
                 let mut explicit_inertia = false;
                 if matches!(self.peek(), Some(t) if t.kind == TokKind::LBrace) {
                     self.pos += 1;
@@ -191,7 +239,7 @@ impl Parser {
                     }
                     self.eat(&TokKind::RBrace)?;
                 }
-                prog.push(Instr::FinishNew { recompute_inertia: !explicit_inertia });
+                prog.push(Instr::FinishNew { recompute_inertia: !explicit_inertia, name });
             }
             TokKind::Keyword(Keyword::Set) => {
                 self.pos += 1;
@@ -312,6 +360,22 @@ impl Parser {
                 self.pos += 1;
                 prog.push(Instr::Contacts);
             }
+            TokKind::Keyword(Keyword::Let) => {
+                self.pos += 1;
+                let name = self.expect_ident("a variable name")?.to_ascii_lowercase();
+                self.eat(&TokKind::Equals)?;
+                self.expr(&mut prog)?;
+                prog.push(Instr::StoreGlobal(name));
+            }
+            TokKind::Keyword(Keyword::Funcs) => {
+                self.pos += 1;
+                prog.push(Instr::ListFns);
+            }
+            TokKind::Keyword(Keyword::Show) => {
+                self.pos += 1;
+                let name = self.expect_ident("a function name")?.to_ascii_lowercase();
+                prog.push(Instr::ShowFn(name));
+            }
             TokKind::Keyword(Keyword::Box) => {
                 self.pos += 1;
                 use crate::vm::BoxMode;
@@ -342,7 +406,7 @@ impl Parser {
             None => {
                 return Err(
                     "parse error: SCENE needs a sub-command (CREATE, CLOSE, TRANSLATE, ROTATE, \
-                     ZOOM, HIDE, SHOW, REFRESH, REDRAW, START, STOP, PAUSE, REVERSE, \
+                     ZOOM, HIDE, SHOW, REFRESH, REDRAW, START, STOP, PAUSE, REVERSE, RESET, \
                      SET_TIME_STEP, STATUS, EVENTS)"
                         .into(),
                 )
@@ -400,6 +464,7 @@ impl Parser {
             TokKind::Keyword(Keyword::Stop) => SceneCmd::Stop,
             TokKind::Keyword(Keyword::Pause) => SceneCmd::Pause,
             TokKind::Keyword(Keyword::Reverse) => SceneCmd::Reverse,
+            TokKind::Keyword(Keyword::Reset) => SceneCmd::ResetPlayback,
             TokKind::Keyword(Keyword::SetTimeStep) => {
                 self.term(prog)?;
                 SceneCmd::SetTimeStep
@@ -410,7 +475,7 @@ impl Parser {
                 return Err(format!(
                     "parse error at column {}: unknown SCENE sub-command {other} \
                      (expected CREATE, CLOSE, TRANSLATE, ROTATE, ZOOM, HIDE, SHOW, REFRESH, \
-                     REDRAW, START, STOP, PAUSE, REVERSE, SET_TIME_STEP, STATUS or EVENTS)",
+                     REDRAW, START, STOP, PAUSE, REVERSE, RESET, SET_TIME_STEP, STATUS or EVENTS)",
                     t.col
                 ))
             }
@@ -518,6 +583,9 @@ impl Parser {
             TokKind::Number(n) => {
                 prog.push(Instr::Push(Value::Num(n)));
             }
+            TokKind::Str(st) => {
+                prog.push(Instr::Push(Value::Str(st)));
+            }
             TokKind::LBracket => {
                 let mut count = 0usize;
                 if matches!(self.peek(), Some(t) if t.kind == TokKind::RBracket) {
@@ -585,14 +653,9 @@ impl Parser {
                     match name.to_ascii_lowercase().as_str() {
                         "pi" => prog.push(Instr::Push(Value::Num(std::f64::consts::PI))),
                         "tau" => prog.push(Instr::Push(Value::Num(std::f64::consts::TAU))),
-                        _ => {
-                            return Err(format!(
-                                "parse error at column {}: unknown name `{name}` \
-                                 (expected a number, `[x,y,z]`, `objN.field`, `system.field`, \
-                                 or a function call)",
-                                t.col
-                            ))
-                        }
+                        /* a bare identifier: a function parameter or a
+                         * LET variable, resolved at execution time */
+                        lower => prog.push(Instr::LoadIdent(lower.to_string())),
                     }
                 }
             }
@@ -622,7 +685,9 @@ fn parse_root(name: &str) -> Result<PathRoot, String> {
             return Ok(PathRoot::Contact(i));
         }
     }
-    Err(format!("unknown path root `{name}` (use `objN`, `contactK` or `system`)"))
+    /* anything else is a USER NAME (an object registered with
+     * `NEW ... AS name`, e.g. `dumbell0.m1`), resolved at execution */
+    Ok(PathRoot::Named(lower))
 }
 
 #[cfg(test)]
@@ -655,7 +720,7 @@ mod tests {
         assert_eq!(p[0], Instr::NewObject(ShapeKind::Sphere));
         assert_eq!(p[2], Instr::InitField("mass".to_string()));
         assert_eq!(p[4], Instr::InitField("radius".to_string()));
-        assert_eq!(p[5], Instr::FinishNew { recompute_inertia: true });
+        assert_eq!(p[5], Instr::FinishNew { recompute_inertia: true, name: None });
     }
 
     #[test]
@@ -735,6 +800,7 @@ mod tests {
             ("scene stop", SceneCmd::Stop),
             ("scene pause", SceneCmd::Pause),
             ("scene reverse", SceneCmd::Reverse),
+            ("scene reset", SceneCmd::ResetPlayback),
             ("scene refresh", SceneCmd::Refresh),
             ("scene redraw", SceneCmd::Redraw),
             ("scene status", SceneCmd::Status),
@@ -755,7 +821,9 @@ mod tests {
         assert!(e.contains("column 5"), "{e}");
         let e = compile_line("get obj0.position.q").unwrap_err();
         assert!(e.contains("component"), "{e}");
-        let e = compile_line("bogusname").unwrap_err();
-        assert!(e.contains("unknown name"), "{e}");
+        /* a bare identifier now COMPILES (function parameters and LET
+         * variables) and resolves at execution instead */
+        let p = compile_line("bogusname").unwrap();
+        assert_eq!(p, vec![Instr::LoadIdent("bogusname".to_string())]);
     }
 }

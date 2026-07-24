@@ -13,14 +13,15 @@ read-only donors; the C reference for sundials lives in
 - Tests: `cargo test --workspace 2>&1 | tee /tmp/test.log`
 - Notebook: `cargo run` (type `HELP`); batch: `cargo run -p posim -- --script <f>`
 - Scene window: type `SCENE CREATE` in the notebook (opens a browser
-  page; `SCENE START/PAUSE/REVERSE`, arrows/drag/wheel in the window).
+  page; `SCENE START/PAUSE/REVERSE/RESET`, arrows/drag/wheel in the
+  window).
   Headless runs: set `POSIM_NO_BROWSER=1` to suppress `xdg-open`.
 - Self-checking physics examples:
   `cargo run -p physical_object --release --example
   {kepler_orbit|outer_solar_system|tumbling_body|charged_in_b_field|newtons_cradle|bouncing_ball_restitution}`
   (each prints SUCCESS/FAILURE and exits nonzero on failure)
 - Collision example scripts: `cargo run -p posim -- --script
-  scripts/collisions/NN_name.posim` (01–11; documented with captured
+  scripts/collisions/NN_name.posim` (01–12; documented with captured
   output in collision_detection.md §9)
 - Wire protocol test: `python3 jupyter/test_protocol.py` (needs
   `cargo build --release` first — it prefers `target/release/posim`,
@@ -59,7 +60,7 @@ read-only donors; the C reference for sundials lives in
   `physical_object_simulator.md`/`.pdf`; the scene window + the
   seven-simulator research survey in `scene_info.md`/`.pdf`; the
   collision science reference (research, chart/tree, porting
-  evaluation, recommendation, 11 examples) in
+  evaluation, recommendation, 12 examples) in
   `collision_detection.md`/`.pdf`.
 - `.backups/` — pre-modification file backups (gitignored). Back up
   before modifying; this repo's git history is the real undo.
@@ -121,8 +122,8 @@ read-only donors; the C reference for sundials lives in
   strategy.
 - Commit after every coherent file group; keep
   `cargo build --workspace` warning-free and `cargo test --workspace`
-  green at every commit (94 tests: 37 lib + 15 collision +
-  9 conservation + 33 posim). Phase gates are tagged
+  green at every commit (99 tests: 39 lib + 16 collision +
+  9 conservation + 35 posim). Phase gates are tagged
   (`phase-posim-green`).
 - New solver features need: a unit or conservation test with an
   analytic expectation, a grammar hook if user-facing (lexer keyword →
@@ -179,7 +180,25 @@ read-only donors; the C reference for sundials lives in
   (`torus_pair_is_order_independent_and_new_is_transactional`); and
   `BOX <size>` after a wall deletion removes the surviving tracked
   slabs before building the new box — no orphan leak
-  (`box_recreate_after_wall_deletion_leaks_nothing`).
+  (`box_recreate_after_wall_deletion_leaks_nothing`); two tumbling
+  dumbbells colliding off-center conserve E, P **and L (about the
+  origin)** to 1e-8 through real CVODE events — the part-wise exact
+  narrow phase puts the impulse pair at one shared contact point
+  (`colliding_dumbbells_conserve_energy_momentum_and_angular_
+  momentum`); scene Reset (toolbar button / window `reset` /
+  `SCENE RESET` — one primitive) restores the playback's initial
+  state **bit-identically**, clears history and the step counter,
+  returns the mode to Stopped, and Start re-runs from the beginning
+  (`reset_restores_the_initial_state_and_start_reruns`); the
+  `create_dumbell` flow — define/call/members/shorthands/renumber/
+  errors/redefine/LET-defaults/ghost-free failing calls —
+  round-trips end-to-end
+  (`def_call_named_objects_and_dumbbell_members`); and the directed
+  supports are exact for BOTH dumbbell ends — asymmetric wall gaps
+  exact, the light end pokes farther (|z1| > |z2| when m2 > m1),
+  ball-vs-pole and ball-vs-rod contacts exact
+  (`dumbbell_wall_gaps_and_ball_contacts_are_exact`,
+  `dumbbell_constructor_com_sdf_and_supports`).
 - Verified UI facts to protect (re-check with a headless-Chrome CDP
   session after touching `scene.html`): arrow keys translate the view
   right/left (and up/down), left-drag orbits yaw+pitch, mouse wheel
@@ -192,4 +211,13 @@ read-only donors; the C reference for sundials lives in
   wall slabs are never drawn as bodies), and torus (outer/inner
   equators + tube rings + 4 cross-sections), disk (rim + 2
   diameters) and cylinder (2 rims + 4 side lines) wireframes render
-  quaternion-rotated so spin is visible.
+  quaternion-rotated so spin is visible; the permanent toolbar
+  Reset button (`bt-reset`) re-initializes the playback (every value
+  and the time bit-back to their initial values) and Start re-runs
+  the simulation from the beginning; the labeled 'conserved
+  quantities' readout (`hud`: E, P and L with components and
+  magnitudes) updates live and reads identically before and after a
+  dumbbell impact; entity labels show the registered user names
+  (`dumbell0`) instead of `objN`; and dumbbells render as one rigid
+  body — two shaded spheres at their rotated COM offsets joined by
+  the rod's four silhouette lines.

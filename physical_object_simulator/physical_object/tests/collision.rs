@@ -547,3 +547,40 @@ fn ball_released_from_rest_does_not_tunnel_the_thin_plate() {
     let toi = (2.0f64 * 4.985 / 10.0).sqrt();
     assert!((c.t - toi).abs() < 1e-6, "TOI {} vs analytic {toi}", c.t);
 }
+
+/// T23 — two rigid dumbbells collide elastically in free space: total
+/// energy, total linear momentum AND total angular momentum (about the
+/// origin) are conserved. L is conserved exactly because the impulse
+/// pair acts at one shared contact point (action–reaction along the
+/// same line ⇒ zero net torque about any point).
+#[test]
+fn colliding_dumbbells_conserve_energy_momentum_and_angular_momentum() {
+    let (mass, db) = ::physical_object::boundary::dumbbell(1.0, 2.0, 0.5, 0.25, 0.25, 0.1, 1.0)
+        .expect("valid dumbbell");
+    let mk = |id: usize, pos: Vec3, vel: Vec3, w: Vec3| {
+        ::physical_object::physical_object::physical_object::new_from_shape(
+            id, mass, 0.0, pos, vel, w, db,
+        )
+    };
+    // Slightly offset approach so the impact is off-center: the hit
+    // exchanges linear AND angular momentum between the bodies.
+    let mut sys = free_system(vec![
+        mk(0, Vec3::new(-2.0, 0.15, 0.0), Vec3::new(1.5, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.6)),
+        mk(1, Vec3::new(2.0, -0.15, 0.0), Vec3::new(-1.5, 0.0, 0.0), Vec3::new(0.4, 0.0, 0.0)),
+    ]);
+    let e0 = sys.total_energy();
+    let p0 = sys.total_momentum();
+    let l0 = sys.total_angular_momentum(Vec3::zeros());
+
+    let report = integrate::run(&mut sys, 3.0, 60).expect("run");
+
+    assert!(report.ncollisions >= 1, "the dumbbells actually met: {}", report.ncollisions);
+    let e1 = sys.total_energy();
+    let p1 = sys.total_momentum();
+    let l1 = sys.total_angular_momentum(Vec3::zeros());
+    assert!(((e1 - e0) / e0).abs() < 1e-8, "energy: {e0} -> {e1}");
+    assert!((p1 - p0).norm() < 1e-9, "linear momentum: {p0:?} -> {p1:?}");
+    assert!((l1 - l0).norm() < 1e-8, "angular momentum: {l0:?} -> {l1:?}");
+    // The collision genuinely redistributed spin.
+    assert!(sys.objects[0].get_angular_momentum().norm() > 1e-6);
+}

@@ -361,12 +361,18 @@ fn state_dump(state: &SimState) -> Json {
                 Boundary::Cylinder { radius, half_height } => {
                     format!("cylinder r={radius} h={}", 2.0 * half_height)
                 }
+                Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+                    format!("dumbbell r1={r1} r2={r2} rod_r={rod_radius} len={}", z2 - z1)
+                }
             }),
         );
         m.insert("kinetic_energy".to_string(), Json::Num(o.kinetic_energy()));
         m.insert("restitution".to_string(), Json::Num(o.get_restitution()));
         m.insert("inverse_mass".to_string(), Json::Num(o.get_inverse_mass()));
         m.insert("wall".to_string(), Json::Bool(state.wall_indices.contains(&i)));
+        if let Some(n) = state.names.iter().find(|(_, oi)| **oi == i).map(|(n, _)| n) {
+            m.insert("name".to_string(), Json::Str(n.clone()));
+        }
         objs.push(Json::Obj(m));
     }
     /* contacts of the last STEP/RUN: pair, event time, point, the

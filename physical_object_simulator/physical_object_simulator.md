@@ -110,7 +110,7 @@ fields:
 | `inertia_tensor` | Mat3 | RigidBody (`local_inertia_tensor`) + RigidBody3D | one body-frame tensor |
 | `inverse_inertia_tensor` | Mat3 | both | coupled; a singular tensor inverts to zero = "cannot rotate" (mirrors `inverse_mass = 0`) |
 | `magnetic_moment_tensor` | Mat3 | RigidBody | torque = (R M Rᵀ)·B |
-| `boundary` | Boundary | RigidBody (`Box<dyn Boundary>` SDF trait) + RigidBody3D (enum) | the **enum** keeps the name — **six variants** now: the legacy `Point`/`Sphere`/`Cuboid` plus `Torus { ring_radius, tube_radius }`, `Disk { radius }` and `Cylinder { radius, half_height }`, each with an exact SDF; the SDF *behavior* survives as the `Sdf` trait — `signed_distance` plus the verbatim central-difference `surface_normal` — implemented *for* the enum. No trait objects, so the struct stays `Clone`-able |
+| `boundary` | Boundary | RigidBody (`Box<dyn Boundary>` SDF trait) + RigidBody3D (enum) | the **enum** keeps the name — **seven variants** now: the legacy `Point`/`Sphere`/`Cuboid` plus `Torus { ring_radius, tube_radius }`, `Disk { radius }`, `Cylinder { radius, half_height }` and the compound `Dumbbell { r1, r2, rod_radius, z1, z2, f1, f2 }` (two solid spheres plus a solid rod as ONE rigid body; the stored mass fractions `f1`/`f2` keep every part mass recoverable), each with an exact SDF; the SDF *behavior* survives as the `Sdf` trait — `signed_distance` plus the verbatim central-difference `surface_normal` — implemented *for* the enum. No trait objects, so the struct stays `Clone`-able |
 
 **Every field has a public `get_x()` / `set_x()` pair** (the coupled
 ones maintain their invariants on every write), plus derived
@@ -125,10 +125,10 @@ Methods carried over verbatim (same arithmetic, same guards):
 (= ½m|v|² + ½ω·L), `to_local_space` / `to_world_space`,
 `signed_distance` / `surface_normal`,
 `recompute_inertia_from_boundary()` (sphere 2/5·m·r²; cuboid
-m/3·(h²+h²) diagonals; Point → zero tensor; the three shapes added by
-the TORUS/DISK/CYLINDER release get the closed forms below).
+m/3·(h²+h²) diagonals; Point → zero tensor; the shapes added by the
+TORUS/DISK/CYLINDER and DUMBBELL releases get the closed forms below).
 
-Each of the three new shapes has an exact SDF and an exact analytic
+Each of the non-legacy shapes has an exact SDF and an exact analytic
 inertia tensor (body frame; z is the shape's symmetry axis):
 
 | shape | parameters | analytic inertia |
@@ -136,11 +136,30 @@ inertia tensor (body frame; z is the shape's symmetry axis):
 | `Torus` | `ring_radius` c (centerline circle), `tube_radius` a | Iz = m·(c² + ¾·a²);  Ix = Iy = m·(½·c² + ⅝·a²) |
 | `Disk` | `radius` a — ideal, zero thickness | Ix = Iy = ¼·m·a²;  Iz = ½·m·a² (perpendicular-axis theorem: Iz = Ix + Iy) |
 | `Cylinder` | `radius` r, `half_height` h (full height 2h) | Iz = ½·m·r²;  Ix = Iy = m·(3r² + 4h²)/12 |
+| `Dumbbell` | sphere radii `r1`/`r2` at (0, 0, z1)/(0, 0, z2), `rod_radius`, mass fractions `f1`/`f2` | exact **composite**: 2/5·m·r² for each sphere plus its parallel-axis term m·z², plus the rod's cylinder terms about the COM |
+
+The dumbbell — two solid spheres joined by a solid rod, **one** rigid
+body — is built by `boundary::dumbbell(m1, m2, m_rod, r1, r2,
+rod_radius, length)`, which places the sphere offsets at
+`z1 = −(m2 + m_rod/2)·L/M` and `z2 = (m1 + m_rod/2)·L/M` (`L` the
+center-to-center length, `M = m1 + m2 + m_rod`) so that the body-frame
+origin **is** the center of mass: the identity
+`m1·z1 + m2·z2 + m_rod·(z1 + z2)/2 = 0` holds exactly (pinned by test).
+Its SDF is the exact **union** — the min of the parts' SDFs — and the
+stored mass fractions make every part mass recoverable from the total,
+which is what lets the grammar's `d.m1`/`.m2`/`.m_rod`/`.r1`/`.r2`/
+`.rod_radius`/`.length` member paths read *and* write the parts (a
+member write rebuilds total mass, COM offsets and the inertia tensor in
+one step).
 
 Every variant also answers an exact **support function** in
 `boundary.rs`: `support_extent(u)` = max over the body of x·u — the
-farthest reach along a direction (for the torus, of its convex hull: a
-support function cannot see the hole) — `support_point(u)`, a point
+farthest reach along a direction, a genuinely **directed** quantity
+since the dumbbell release (the dumbbell is the first
+non-centrally-symmetric shape: its off-center spheres make
+h(u) ≠ h(−u); every symmetric shape's closed form is unchanged; for the
+torus it is the support of its convex hull: a support function cannot
+see the hole) — `support_point(u)`, a point
 achieving that extent, which returns the **centroid of the supporting
 set** when that set is a whole face, edge, circle or cap (so a flat-on
 contact puts its contact point at the face center and carries no
@@ -381,7 +400,7 @@ example:
 
 ---
 
-## 8. Thirteen more worked examples
+## 8. Fourteen more worked examples
 
 These are *additional* to the command-language examples in
 grammar.md — they exercise the **Rust library API**, the **machine
@@ -822,6 +841,57 @@ In the scene window the same setup shows the new wireframes — torus,
 disk, cylinder, quaternion-rotated — plus a dashed interior box
 outline; the wall slabs themselves are not drawn as bodies.
 
+### Example S14 — two dumbbells: a user-defined function builds them, and E, P **and** L survive the impact
+
+The committed script `scripts/collisions/12_two_dumbbells.posim` defines
+`create_dumbell(...)` **in the notebook language** (`DEF` — eleven
+parameters, all but the name with defaults) and calls it twice to build
+two **named** rigid dumbbells — two solid spheres joined by a solid rod,
+one rigid body whose local origin is its center of mass (§3). They
+approach off-center with spin and collide twice, elastically, with
+G = 0. Abridged captured session (the full transcript is Example 12 of
+`collision_detection.md`):
+
+```
+In[3]:= create_dumbell("dumbell0", 1, 2, 0.5, 0.25, 0.25, 0.1, 1, [-2, 0.15, 0], [1.5, 0, 0], [0, 0, 0.6])
+Out[3]= obj0 as dumbell0
+In[4]:= create_dumbell("dumbell1", 2, 1, 0.4, 0.3, 0.2, 0.08, 1.2, [2, -0.15, 0], [-1.5, 0, 0], [0.4, 0, 0])
+Out[4]= obj1 as dumbell1
+In[9]:= energy
+Out[9]= 7.865310611764706
+In[10]:= momentum
+Out[10]= [0.15000000000000036, 0, 0]
+In[11]:= angmom
+Out[11]= [0.4443030588235295, 0, -1.5059999999999998]
+In[12]:= run 3 steps 60
+Out[12]= t = 3 (3861 solver steps, 60 snapshots, |dE/E| = 9.463e-11, 2 collision(s) — CONTACTS lists them)
+In[13]:= energy
+Out[13]= 7.865310611020375
+In[14]:= momentum
+Out[14]= [0.15000000000000036, 0, 0]
+In[15]:= angmom
+Out[15]= [0.44430305882373156, -0.000000000000009547918011776346, -1.505999999999855]
+```
+
+*What to notice.* Through two real CVODE collision events, energy drifts
+by `|dE/E| = 9.463e-11` (printed by the run line itself), momentum is
+**bit-identical**, and total angular momentum about the origin drifts at
+the 1e-13 level — **all three conserved at once**, unlike Example S13,
+where the infinitely massive walls legitimately ate momentum. Nothing
+here is static, and each impulse pair ±Jn̂ acts at **one shared contact
+point**, so the two angular impulses about any origin cancel exactly:
+action–reaction produces zero net torque (the anchor test
+`colliding_dumbbells_conserve_energy_momentum_and_angular_momentum`
+pins E, P and L to 1e-8). In the scene window the entity labels show
+the registered user names (`dumbell0`, `dumbell1`), the dumbbells draw
+as two shaded spheres at their rotated COM offsets joined by the rod's
+four silhouette lines, and the window's permanent labeled
+'conserved quantities' readout displayed
+`E = 7.86531061, P = [0.15000, 0.00000, 0.00000] |.| = 0.15000, L =
+[0.44430, 0.00000, -1.50600] |.| = 1.57017`
+identically before and after the impact (after it, L's y component read
+`-1.31228e-13`).
+
 ---
 
 ## 9. Building, running, testing (copy-paste)
@@ -860,7 +930,7 @@ time of impact), resolve them with an impulse along the **contact
 normal** — the action–reaction line, exposed as `contactK.normal` —
 and continue. Per-object `restitution` (default 1 = elastic), the
 `COLLIDE`/`CONTACTS` commands, and the full science reference (seven
-simulators surveyed, comparison chart, porting evaluation, eleven
+simulators surveyed, comparison chart, porting evaluation, twelve
 worked examples with captured output) live in **`collision_detection.md` /
 `collision_detection.pdf`**. Quick taste:
 
@@ -873,9 +943,9 @@ In [4]: get contact0.normal
 Out[4]= [1, 0, 0]
 ```
 
-**The shape tiers.** With the `Boundary` enum at six variants (§3;
-created with `NEW TORUS|DISK|CYLINDER { … }` — grammar.md has the
-parameter grammar), `collide.rs` dispatches every pair in three
+**The shape tiers.** With the `Boundary` enum at seven variants (§3;
+created with `NEW TORUS|DISK|CYLINDER|DUMBBELL { … }` — grammar.md has
+the parameter grammar), `collide.rs` dispatches every pair in three
 exactness tiers — still no GJK/EPA machinery anywhere:
 
 1. **Ball vs anything — exact, via SDF closest points.** A *ball* (a
@@ -909,6 +979,16 @@ exactness tiers — still no GJK/EPA machinery anywhere:
    face contacts at the cap center. At this tier the torus is its
    convex hull: only balls thread the hole.
 
+**Compound bodies decompose.** The dumbbell never reaches a tier as a
+whole: the narrow phase decomposes dumbbell-vs-anything over its parts —
+each sphere part is a ball tested through the other shape's exact SDF
+(tier 1, exact against everything, *including another dumbbell*, whose
+union SDF is exact), the rod recurses as a free-standing cylinder, and
+the deepest part supplies the contact; only **rod-vs-rod** ever reaches
+the approximate tier 3. Dynamically the dumbbell stays **one** rigid
+body, and because the impulse pair acts at one shared contact point, two
+colliding dumbbells conserve E, P *and* L (Example S14).
+
 **The rigid box: `BOX <size>` | `BOX OFF` | `BOX`.** One command walls
 the world in: six **static `Cuboid` wall slabs** enclosing an inner
 size × size × size cube. "Infinitely massive" is exact, not an
@@ -941,7 +1021,10 @@ inside one.
   a genuinely skew corner-on approach may register contact slightly
   early, along the nearest candidate axis — a convex-hull-level answer.
   In particular that tier sees the torus's convex hull, so **only balls
-  (spheres/points) can thread the torus hole**.
+  (spheres/points) can thread the torus hole**. The dumbbell decomposes
+  over its parts (§10), so its sphere contacts are exact against
+  everything; only **rod-vs-rod** — two dumbbells meeting rod against
+  rod — remains a support-axis pair and shares the skew-corner caveat.
 - **The ideal disk is transparent to point particles — and to a
   parallel ideal disk.** A zero-thickness disk meets a zero-radius
   point in a measure-zero event — the disk's unsigned distance touches

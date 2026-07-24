@@ -78,6 +78,7 @@
       <button id="bt-pause"   title="Pause evolution (Space)">&#10074;&#10074; Pause</button>
       <button id="bt-stop"    title="Stop evolution and clear history">&#9632; Stop</button>
       <button id="bt-reverse" title="Play backward through recorded history">&#9664; Reverse</button>
+      <button id="bt-reset"   title="Re-initialize: every value returns to its initial value and time returns to its initial value; Start then runs the simulation again">&#8634; Reset</button>
       <button id="bt-back"    title="One step backward">&#8676;</button>
       <button id="bt-step"    title="One step forward">&#8677;</button>
     </span>
@@ -122,6 +123,13 @@
     </div>
   </div>
 
+  <div id="hud" style="position:absolute; top:44px; left:10px; z-index:5;
+       font: 12px ui-monospace, monospace; color:#c6d2df;
+       background:rgba(10,14,20,0.55); padding:6px 9px; border-radius:6px;
+       pointer-events:none; white-space:pre;">conserved quantities
+E  = &ndash;
+P  = &ndash;
+L  = &ndash;</div>
   <div id="statusbar">
     <span><span id="conn-dot"></span><span id="st-conn">connecting&hellip;</span></span>
     <span>mode <b id="st-mode" class="mode-stopped">stopped</b></span>
@@ -154,6 +162,7 @@ const state = {
   hidden: new Set(),
   trails: [],             /* per entity: array of [x,y,z]             */
   t: 0, dt: 0.01, mode: "stopped", energy: NaN, history: 0,
+  ptot: null, ltot: null,      /* total momentum / angular momentum */
   cam: { yaw: -60, pitch: 55, dist: 12, target: [0, 0, 0] },
   homeCam: null,
   showGrid: true, showTrails: true, showLabels: true, showContacts: true,
@@ -225,6 +234,7 @@ function applyFrame(msg) {
   state.hidden = new Set(msg.hidden || []);
   state.t = msg.t; state.dt = msg.dt; state.mode = msg.mode;
   state.energy = msg.energy; state.history = msg.history;
+  state.ptot = msg.p || null; state.ltot = msg.l || null;
   /* contact normals: refresh the flash list (deduplicated by pair) */
   const now = performance.now();
   state.contactCount = (msg.contacts || []).length;
@@ -375,6 +385,8 @@ function draw() {
       drawDisk(ent, pos, b, basis, w, h, focal, color);
     } else if (ent.shape === "cylinder") {
       drawCylinder(ent, pos, b, basis, w, h, focal, color);
+    } else if (ent.shape === "dumbbell") {
+      drawDumbbell(ent, pos, b, basis, w, h, focal, color);
     } else {
       const rWorld = ent.shape === "sphere" ? ent.radius : 0;
       const rPix = Math.max(3, focal * rWorld / s.z);
@@ -391,7 +403,7 @@ function draw() {
     if (state.showLabels) {
       ctx.fillStyle = "#c6d2df";
       ctx.font = "11px system-ui";
-      ctx.fillText("obj" + i, s.x + 8, s.y - 8);
+      ctx.fillText(ent.name || ("obj" + i), s.x + 8, s.y - 8);
     }
   }
 
@@ -537,6 +549,38 @@ function drawCylinder(ent, pos, b, basis, w, h, focal, color) {
   }
 }
 
+/* Dumbbell: two shaded spheres at their (rotated) offsets joined by
+ * the rod's two silhouette lines — one rigid body, spin visible. */
+function drawDumbbell(ent, pos, b, basis, w, h, focal, color) {
+  const q = b ? [b[3], b[4], b[5], b[6]] : [1, 0, 0, 0];
+  const centers = [[ent.z1 || -0.5, ent.r1 || 0.25], [ent.z2 || 0.5, ent.r2 || 0.25]];
+  /* rod silhouette: 4 lines between the sphere centers offset radially */
+  ctx.strokeStyle = color; ctx.lineWidth = 1.2;
+  const rodr = ent.rod_radius || 0.1;
+  for (const dir of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const a = rotateByQuat([dir[0] * rodr, dir[1] * rodr, ent.z1 || -0.5], q);
+    const c = rotateByQuat([dir[0] * rodr, dir[1] * rodr, ent.z2 || 0.5], q);
+    const sa = project([pos[0] + a[0], pos[1] + a[1], pos[2] + a[2]], basis, w, h, focal);
+    const sc = project([pos[0] + c[0], pos[1] + c[1], pos[2] + c[2]], basis, w, h, focal);
+    if (sa && sc) { ctx.beginPath(); ctx.moveTo(sa.x, sa.y); ctx.lineTo(sc.x, sc.y); ctx.stroke(); }
+  }
+  for (const [zc, r] of centers) {
+    const c = rotateByQuat([0, 0, zc], q);
+    const sp = project([pos[0] + c[0], pos[1] + c[1], pos[2] + c[2]], basis, w, h, focal);
+    if (!sp) continue;
+    const rPix = Math.max(3, focal * r / sp.z);
+    const grad = ctx.createRadialGradient(
+      sp.x - rPix * 0.3, sp.y - rPix * 0.3, rPix * 0.1, sp.x, sp.y, rPix);
+    grad.addColorStop(0, "#ffffff");
+    grad.addColorStop(0.25, color);
+    grad.addColorStop(1, "rgba(0,0,0,0.85)");
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(sp.x, sp.y, rPix, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+}
+
 /* The rigid bounding box: a dashed light wireframe of the interior
  * cube (the six static wall slabs are not drawn as bodies). */
 function drawBox(size, basis, w, h, focal) {
@@ -619,6 +663,12 @@ function updateStatus() {
   el("st-time").textContent = fmt(state.t, 4);
   el("st-dt").textContent = state.dt;
   el("st-energy").textContent = fmt(state.energy, 5);
+  const v3 = (v) => v ? "[" + v.map((x) => fmt(x, 5)).join(", ") + "]  |.| = " +
+                        fmt(Math.hypot(v[0], v[1], v[2]), 5) : "\u2013";
+  el("hud").textContent = "conserved quantities\n" +
+    "E  = " + fmt(state.energy, 8) + "\n" +
+    "P  = " + v3(state.ptot) + "\n" +
+    "L  = " + v3(state.ltot);
   el("st-bodies").textContent = state.entities.length;
   el("st-hidden").textContent = state.hidden.size;
   el("st-contacts").textContent = state.contactCount;
@@ -638,6 +688,7 @@ on("bt-start",   () => sendCmd("start"));
 on("bt-pause",   () => sendCmd("pause"));
 on("bt-stop",    () => { sendCmd("stop"); state.trails = state.entities.map(() => []); });
 on("bt-reverse", () => sendCmd("reverse"));
+on("bt-reset",   () => { sendCmd("reset"); state.trails = state.entities.map(() => []); state.contactFlash = []; });
 on("bt-step",    () => sendCmd("step"));
 on("bt-back",    () => sendCmd("step_back"));
 on("bt-setdt",   () => {

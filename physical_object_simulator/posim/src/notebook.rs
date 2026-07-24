@@ -124,14 +124,32 @@ impl Notebook {
             }
             "%load" => match std::fs::read_to_string(&rest) {
                 Ok(text) => {
+                    /* joins continuation lines by brace depth, exactly
+                     * like script mode — a %saved multi-line DEF must
+                     * replay as ONE cell */
                     let mut shown = Vec::new();
-                    for line in text.lines() {
-                        let line = line.trim();
-                        if line.is_empty() || line.starts_with('#') {
+                    let mut pending = String::new();
+                    let mut depth = 0i32;
+                    for raw in text.lines() {
+                        let line = raw.trim_end();
+                        if depth == 0 {
+                            let t = line.trim();
+                            if t.is_empty() || t.starts_with('#') {
+                                continue;
+                            }
+                            pending = t.to_string();
+                            depth = brace_delta(t);
+                        } else {
+                            depth += brace_delta(line);
+                            pending.push('\n');
+                            pending.push_str(line);
+                        }
+                        if depth > 0 {
                             continue;
                         }
-                        shown.push(format!("In[{}]:= {}", self.cells.len() + 1, line));
-                        let out = self.execute_cell(line);
+                        let cell = std::mem::take(&mut pending);
+                        shown.push(format!("In[{}]:= {}", self.cells.len() + 1, cell));
+                        let out = self.execute_cell(&cell);
                         if !out.is_empty() {
                             shown.push(out);
                         }
@@ -149,6 +167,35 @@ impl Notebook {
     }
 }
 
+/// Net `{`/`}` depth of a line, ignoring braces inside string
+/// literals and after `#` comments — the notebook keeps reading
+/// continuation lines while a `DEF ... {` block is open.
+fn brace_delta(line: &str) -> i32 {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut prev_escape = false;
+    for c in line.chars() {
+        if in_str {
+            if prev_escape {
+                prev_escape = false;
+            } else if c == '\\' {
+                prev_escape = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '#' => break,
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
 /// Interactive notebook loop over stdin/stdout.
 pub fn repl() {
     let mut nb = Notebook::default();
@@ -164,10 +211,27 @@ pub fn repl() {
             Ok(_) => {}
             Err(_) => break,
         }
-        let line = line.trim();
+        let mut line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
+        /* multi-line input: keep reading while braces stay open (a
+         * DEF body); the prompt shows the continuation */
+        let mut depth = brace_delta(&line);
+        while depth > 0 {
+            print!("  ...:= ");
+            let _ = std::io::stdout().flush();
+            let mut more = String::new();
+            match stdin.lock().read_line(&mut more) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            depth += brace_delta(&more);
+            line.push('\n');
+            line.push_str(more.trim_end());
+        }
+        let line = line.as_str();
         if line.starts_with('%') {
             match nb.magic(line) {
                 Some(msg) => {
@@ -192,11 +256,27 @@ pub fn run_script(path: &str) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let mut nb = Notebook::default();
     let mut failed = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    let mut pending = String::new();
+    let mut depth = 0i32;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if depth == 0 {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            pending = t.to_string();
+            depth = brace_delta(t);
+        } else {
+            depth += brace_delta(line);
+            pending.push('\n');
+            pending.push_str(line);
         }
+        if depth > 0 {
+            continue; /* still inside a DEF block */
+        }
+        let line = std::mem::take(&mut pending);
+        let line = line.as_str();
         println!("In[{}]:= {}", nb.cells.len() + 1, line);
         if line.starts_with('%') {
             match nb.magic(line) {
@@ -241,6 +321,35 @@ mod tests {
         assert!(out.starts_with("Err[3]:"), "{out}");
         assert_eq!(nb.cells.len(), 3);
         assert!(!nb.cells[2].ok);
+    }
+
+    #[test]
+    fn save_load_round_trips_a_multiline_def() {
+        let dir = std::env::temp_dir().join("posim_nb_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("roundtrip.posim");
+        let path_s = path.to_string_lossy().to_string();
+
+        let mut nb = Notebook::default();
+        let def = "def probe(m = 2) {\n  new sphere { mass = m }\n}";
+        assert!(nb.execute_cell(def).contains("defined"));
+        nb.execute_cell("probe()");
+        assert_eq!(nb.state.system.objects.len(), 1);
+        let saved = nb.magic(&format!("%save {path_s}")).unwrap();
+        assert!(saved.contains("saved"), "{saved}");
+
+        /* a fresh notebook replays the file: the multi-line DEF must
+         * come back as ONE cell and the call must work again */
+        let mut nb2 = Notebook::default();
+        let out = nb2.magic(&format!("%load {path_s}")).unwrap();
+        assert!(out.contains("defined"), "DEF replayed: {out}");
+        assert_eq!(nb2.state.system.objects.len(), 1, "probe() replayed");
+        assert_eq!(
+            nb2.state.system.objects[0].get_mass(),
+            2.0,
+            "default argument survived the round-trip"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

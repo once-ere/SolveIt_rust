@@ -296,6 +296,7 @@ fn collision_hmax(
             Boundary::Torus { tube_radius, .. } => tube_radius,
             Boundary::Disk { radius } => radius,
             Boundary::Cylinder { radius, half_height } => radius.min(half_height),
+            Boundary::Dumbbell { r1, r2, rod_radius, .. } => r1.min(r2).min(rod_radius),
         }
     };
     let growth = growth.max(0.0);

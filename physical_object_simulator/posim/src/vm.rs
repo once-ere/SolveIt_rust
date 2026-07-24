@@ -3,6 +3,7 @@
 //! [`PhysicalObjectSystem`]. All field access goes through the
 //! `physical_object` get/set API — the VM never pokes raw state.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use ::physical_object::boundary::Boundary;
@@ -71,6 +72,10 @@ pub enum PathRoot {
     System,
     /// A recorded contact of the last STEP/RUN (read-only).
     Contact(usize),
+    /// A user name registered with `NEW ... AS name` (resolved through
+    /// the name registry at execution; a function parameter or LET
+    /// variable holding a string indirects to that name first).
+    Named(String),
 }
 
 /// A dotted access path: `obj0.position.x`, `system.g_constant`,
@@ -89,6 +94,7 @@ impl fmt::Display for Path {
             PathRoot::Object(i) => write!(f, "obj{i}.{}", self.field)?,
             PathRoot::System => write!(f, "system.{}", self.field)?,
             PathRoot::Contact(k) => write!(f, "contact{k}.{}", self.field)?,
+            PathRoot::Named(n) => write!(f, "{n}.{}", self.field)?,
         }
         if let Some(c) = self.comp {
             write!(f, ".{}", ["x", "y", "z", "w"][c.min(3)])?;
@@ -106,6 +112,30 @@ pub enum ShapeKind {
     Torus,
     Disk,
     Cylinder,
+    Dumbbell,
+}
+
+/// The `AS <name>` argument of NEW: a bare identifier (resolved
+/// against a parameter/LET string binding at execution, else taken
+/// literally) or an exact string literal.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NameArg {
+    Ident(String),
+    Str(String),
+}
+
+/// A user-defined function: `DEF name(params) { body }`. The body is
+/// kept as SOURCE lines (recompiled per call), which is also what
+/// `SHOW` prints and what `%save` round-trips.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FuncDef {
+    /// Parameter names with optional default values (evaluated once,
+    /// at definition time).
+    pub params: Vec<(String, Option<Value>)>,
+    /// Newline/semicolon-separated body commands.
+    pub body: Vec<String>,
+    /// The verbatim definition source (for SHOW / editing).
+    pub source: String,
 }
 
 /// Parsed `BOX` command mode (`Create` pops the inner side length).
@@ -152,6 +182,9 @@ pub enum SceneCmd {
     Stop,
     Pause,
     Reverse,
+    /// Re-initialize the playback: every mutable value and the time
+    /// return to their initial (last-synced) values; Start re-starts.
+    ResetPlayback,
     /// Pop dt: set the playback time step.
     SetTimeStep,
     Status,
@@ -180,6 +213,7 @@ pub enum Instr {
     InitField(String),
     FinishNew {
         recompute_inertia: bool,
+        name: Option<NameArg>,
     },
     Delete(usize),
     ListObjects,
@@ -206,6 +240,14 @@ pub enum Instr {
     /// `BOX [OFF | <size>]` — the rigid, infinitely massive bounding
     /// box (six static wall slabs with inverse mass 0).
     Box(BoxMode),
+    /// Push a function parameter / `LET` variable.
+    LoadIdent(String),
+    /// `LET name = expr` — pop and store a session variable.
+    StoreGlobal(String),
+    /// `FUNCS` — list the user-defined functions.
+    ListFns,
+    /// `SHOW name` — print a user function's definition source.
+    ShowFn(String),
 }
 
 /// The mutable simulator state driven by the notebook / machine modes.
@@ -229,6 +271,19 @@ pub struct SimState {
     /// list: `[ring, tube, inner, outer]`, resolved and validated ONCE
     /// in `FinishNew` so the inner/outer pair is order-independent.
     pending_torus: Option<[Option<f64>; 4]>,
+    /// Deferred dumbbell parts from a `NEW DUMBBELL { ... }` list:
+    /// `[m1, m2, m_rod, r1, r2, rod_radius, length]`, resolved and
+    /// validated once in `FinishNew`.
+    pending_dumbbell: Option<[Option<f64>; 7]>,
+    /// `LET` session variables.
+    pub globals: BTreeMap<String, Value>,
+    /// User-defined functions (`DEF name(...) { ... }`).
+    pub functions: BTreeMap<String, FuncDef>,
+    /// User names registered with `NEW ... AS name` → object index
+    /// (kept renumbered by DEL / BOX OFF).
+    pub names: BTreeMap<String, usize>,
+    /// Call frames of executing user functions (parameter bindings).
+    env_stack: Vec<BTreeMap<String, Value>>,
 }
 
 impl Default for SimState {
@@ -243,6 +298,11 @@ impl Default for SimState {
             pending_velocity: None,
             pending_angular_velocity: None,
             pending_torus: None,
+            pending_dumbbell: None,
+            globals: BTreeMap::new(),
+            functions: BTreeMap::new(),
+            names: BTreeMap::new(),
+            env_stack: Vec::new(),
         }
     }
 }
@@ -264,6 +324,34 @@ posim command language (case-insensitive keywords):
                             representable); objects collide elastically
                             off the inside faces; bare BOX = status;
                             GET system.box reads the size (0 = none)
+  NEW <shape> AS <name> { ... }
+                            register a user NAME for the object: paths
+                            then use the name (ball.mass, dumbell0.m1);
+                            inside a function a parameter holding a
+                            string names the object it creates
+  NEW DUMBBELL AS d { m1 = ..., m2 = ..., m_rod = ..., r1 = ..., r2 = ...,
+                      rod_radius = ..., length = ..., position = ..., ... }
+                            ONE rigid body: two solid spheres joined by
+                            a rigid rod; the local origin is the COM;
+                            d.m1 d.m2 d.m_rod d.r1 d.r2 d.rod_radius
+                            d.length read AND write the parts (mass,
+                            COM offsets and inertia recompute); every
+                            object also has the shorthands .x .y .z and
+                            .vx .vy .vz for position/velocity components
+  DEF name(p1, p2 = default, ...) { <body lines> }
+                            define a user function: the body is
+                            newline/;-separated commands using the
+                            parameters as variables; every line is
+                            syntax-checked at definition; trailing
+                            arguments take their defaults; re-DEF
+                            replaces (that is how you edit); the
+                            notebook keeps reading `...` lines until
+                            the closing brace
+  name(arg, ...)            call it (returns the last body line's value)
+  LET name = <expr>         session variable (visible in expressions
+                            and as defaults)
+  FUNCS | SHOW <name>       list functions / print one's source
+  \"text\"                  string literal (names, function arguments)
   SET <path> = <expr>       write a field   (e.g. SET obj0.mass = 2)
   GET <path>                read a field    (e.g. GET obj0.position.x)
       paths: objN.<field>[.x|y|z|w], system.<field>, contactK.<field>
@@ -306,6 +394,10 @@ graphical scene window (opens in your web browser):
   SCENE START | STOP | PAUSE | REVERSE
                             control the time-stepped evolution
                             (REVERSE replays recorded history backward)
+  SCENE RESET               re-initialize the playback: every value and
+                            the time return to their initial values;
+                            START then re-starts the simulation (the
+                            window's Reset button does the same)
   SCENE SET_TIME_STEP dt    set the playback time step
   SCENE STATUS              connection / camera / playback report
   SCENE EVENTS              read async events sent by the window
@@ -467,7 +559,12 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
                 args.push(pop(stack)?);
             }
             args.reverse();
-            stack.push(call_builtin(name, args)?);
+            if state.functions.contains_key(name) {
+                let ret = call_user_function(name, args, state)?;
+                stack.push(ret);
+            } else {
+                stack.push(call_builtin(name, args)?);
+            }
         }
         Instr::NewObject(shape) => {
             let id = state.system.objects.len();
@@ -520,12 +617,31 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
                     Vec3::zeros(),
                     Boundary::Cylinder { radius: 0.5, half_height: 1.0 },
                 ),
+                ShapeKind::Dumbbell => {
+                    /* defaults: m1 = m2 = 1, m_rod = 0.5, r1 = r2 = 0.25,
+                     * rod_radius = 0.1, length = 1 (overridden by the
+                     * deferred initializers in FinishNew) */
+                    let (mass, b) = ::physical_object::boundary::dumbbell(
+                        1.0, 1.0, 0.5, 0.25, 0.25, 0.1, 1.0,
+                    )
+                    .expect("default dumbbell parameters are valid");
+                    physical_object::new_from_shape(
+                        id,
+                        mass,
+                        0.0,
+                        Vec3::zeros(),
+                        Vec3::zeros(),
+                        Vec3::zeros(),
+                        b,
+                    )
+                }
             };
             let idx = state.system.add_object(obj);
             state.last_new = Some(idx);
             state.pending_velocity = None;
             state.pending_angular_velocity = None;
             state.pending_torus = None;
+            state.pending_dumbbell = None;
         }
         Instr::InitField(field) => {
             let v = pop(stack)?;
@@ -572,6 +688,34 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
                     };
                     state.pending_torus.get_or_insert([None; 4])[slot] = Some(n);
                 }
+                /* dumbbell parts are deferred the same way and
+                 * validated once in FinishNew via boundary::dumbbell */
+                "m1" | "m2" | "m_rod" | "r1" | "r2" | "rod_radius" | "rod_r" | "length" | "len"
+                    if matches!(
+                        state.system.objects.get(idx).map(|o| o.get_boundary()),
+                        Some(Boundary::Dumbbell { .. })
+                    ) =>
+                {
+                    let n = match v {
+                        Value::Num(n) => n,
+                        v => {
+                            return Err(format!(
+                                "{field} expects a number, got {}",
+                                type_name(&v)
+                            ))
+                        }
+                    };
+                    let slot = match field.as_str() {
+                        "m1" => 0,
+                        "m2" => 1,
+                        "m_rod" => 2,
+                        "r1" => 3,
+                        "r2" => 4,
+                        "rod_radius" | "rod_r" => 5,
+                        _ => 6,
+                    };
+                    state.pending_dumbbell.get_or_insert([None; 7])[slot] = Some(n);
+                }
                 _ => {
                     let path = Path {
                         root: PathRoot::Object(idx),
@@ -582,7 +726,7 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
                 }
             }
         }
-        Instr::FinishNew { recompute_inertia } => {
+        Instr::FinishNew { recompute_inertia, name } => {
             let idx = state
                 .last_new
                 .ok_or_else(|| "internal error: FinishNew outside NEW".to_string())?;
@@ -611,6 +755,34 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
                     });
                 }
             }
+            /* Resolve deferred dumbbell parts: start from the current
+             * (default) parts and override with whatever was given —
+             * boundary::dumbbell validates once against final values. */
+            if let Some(pd) = state.pending_dumbbell.take() {
+                if let Some(o) = state.system.objects.get_mut(idx) {
+                    let (m1, m2, m_rod, r1, r2, rod_r, len) =
+                        dumbbell_members(o).ok_or_else(|| {
+                            "internal error: pending dumbbell on a non-dumbbell".to_string()
+                        })?;
+                    let (mass, b) = ::physical_object::boundary::dumbbell(
+                        pd[0].unwrap_or(m1),
+                        pd[1].unwrap_or(m2),
+                        pd[2].unwrap_or(m_rod),
+                        pd[3].unwrap_or(r1),
+                        pd[4].unwrap_or(r2),
+                        pd[5].unwrap_or(rod_r),
+                        pd[6].unwrap_or(len),
+                    )?;
+                    o.set_mass(mass);
+                    o.set_boundary(b);
+                }
+            }
+            /* Resolve and validate the AS name BEFORE committing (an
+             * error here rolls the whole NEW back in `execute`). */
+            let resolved_name = match name {
+                None => None,
+                Some(arg) => Some(resolve_name_arg(state, arg)?),
+            };
             state.last_new = None;
             if *recompute_inertia {
                 if let Some(o) = state.system.objects.get_mut(idx) {
@@ -629,7 +801,13 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
                     o.set_angular_velocity(w);
                 }
             }
-            stack.push(Value::Str(format!("obj{idx}")));
+            match resolved_name {
+                Some(n) => {
+                    state.names.insert(n.clone(), idx);
+                    stack.push(Value::Str(format!("obj{idx} as {n}")));
+                }
+                None => stack.push(Value::Str(format!("obj{idx}"))),
+            }
         }
         Instr::Delete(i) => {
             if state.system.remove_object(*i).is_none() {
@@ -642,6 +820,8 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
                     *w -= 1;
                 }
             }
+            /* user names renumber the same way */
+            unregister_index(&mut state.names, *i);
             if state.wall_indices.len() < 6 && state.box_size.is_some() {
                 state.box_size = None; // a wall was deleted: no closed box anymore
             }
@@ -669,6 +849,9 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
                     Boundary::Disk { radius } => format!("disk r={radius}"),
                     Boundary::Cylinder { radius, half_height } => {
                         format!("cylinder r={radius} h={}", 2.0 * half_height)
+                    }
+                    Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, .. } => {
+                        format!("dumbbell r1={r1} r2={r2} rod_r={rod_radius} len={}", z2 - z1)
                     }
                 };
                 let p = o.get_position();
@@ -763,7 +946,7 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
                 s.sync(&state.system)?;
                 /* the fresh state has no box: clear the window's box
                  * wireframe and wall flags too */
-                s.set_box(state.box_size, &state.wall_indices)?;
+                s.set_box(state.box_size, &state.wall_indices, &state.names)?;
                 state.scene = Some(s);
             }
             stack.push(Value::Str("system reset".to_string()));
@@ -813,7 +996,182 @@ fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
             let out = exec_box(*mode, state, stack)?;
             stack.push(Value::Str(out));
         }
+        Instr::LoadIdent(name) => {
+            let v = state
+                .env_stack
+                .last()
+                .and_then(|env| env.get(name))
+                .or_else(|| state.globals.get(name))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "unknown name `{name}` (define it with LET, pass it as a function \
+                         parameter, or use `{name}.field` for a registered object)"
+                    )
+                })?;
+            stack.push(v);
+        }
+        Instr::StoreGlobal(name) => {
+            let v = pop(stack)?;
+            state.globals.insert(name.clone(), v);
+            stack.push(Value::Str(format!("{name} set")));
+        }
+        Instr::ListFns => {
+            if state.functions.is_empty() {
+                stack.push(Value::Str(
+                    "(no user functions — DEF name(params) { body } creates one)".to_string(),
+                ));
+            } else {
+                let mut out = String::new();
+                for (i, (name, f)) in state.functions.iter().enumerate() {
+                    if i > 0 {
+                        out.push('\n');
+                    }
+                    let sig: Vec<String> = f
+                        .params
+                        .iter()
+                        .map(|(p, d)| match d {
+                            Some(v) => format!("{p} = {v}"),
+                            None => p.clone(),
+                        })
+                        .collect();
+                    out.push_str(&format!(
+                        "{name}({}) — {} body line(s); SHOW {name} prints it",
+                        sig.join(", "),
+                        f.body.len()
+                    ));
+                }
+                stack.push(Value::Str(out));
+            }
+        }
+        Instr::ShowFn(name) => {
+            let f = state.functions.get(name).ok_or_else(|| {
+                format!(
+                    "no user function `{name}` — FUNCS lists the defined ones"
+                )
+            })?;
+            stack.push(Value::Str(f.source.clone()));
+        }
     }
+    Ok(())
+}
+
+/// Removes a deleted object index from the name registry and shifts
+/// every higher index down by one (Vec renumbering).
+fn unregister_index(names: &mut BTreeMap<String, usize>, removed: usize) {
+    names.retain(|_, i| *i != removed);
+    for i in names.values_mut() {
+        if *i > removed {
+            *i -= 1;
+        }
+    }
+}
+
+/// Resolves an `AS` name argument: a string literal is taken exactly;
+/// a bare identifier first looks for a parameter / LET string binding
+/// (so a function can name objects from its arguments), else names the
+/// identifier itself. The result is validated against the reserved
+/// path roots and existing names.
+fn resolve_name_arg(state: &SimState, arg: &NameArg) -> Result<String, String> {
+    let raw = match arg {
+        NameArg::Str(st) => st.clone(),
+        NameArg::Ident(id) => match state
+            .env_stack
+            .last()
+            .and_then(|env| env.get(id))
+            .or_else(|| state.globals.get(id))
+        {
+            Some(Value::Str(st)) => st.clone(),
+            _ => id.clone(),
+        },
+    };
+    let name = raw.to_ascii_lowercase();
+    let valid = !name.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Err(format!(
+            "`{raw}` is not a valid object name (letters, digits and _ only, starting \
+             with a letter)"
+        ));
+    }
+    if name == "system" || name == "sys" {
+        return Err(format!("`{name}` is reserved"));
+    }
+    let digits_after = |prefix: &str| {
+        name.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+    };
+    if digits_after("obj") || digits_after("contact") {
+        return Err(format!("`{name}` is reserved for positional paths"));
+    }
+    if state.names.contains_key(&name) {
+        return Err(format!(
+            "the name `{name}` already refers to obj{} — DEL it or pick another name",
+            state.names[&name]
+        ));
+    }
+    Ok(name)
+}
+
+/// Resolves a named path root to an object index: a parameter / LET
+/// string binding indirects first, then the name registry.
+fn resolve_name(state: &SimState, name: &str) -> Result<usize, String> {
+    let target = match state
+        .env_stack
+        .last()
+        .and_then(|env| env.get(name))
+        .or_else(|| state.globals.get(name))
+    {
+        Some(Value::Str(st)) => st.to_ascii_lowercase(),
+        _ => name.to_string(),
+    };
+    state.names.get(&target).copied().ok_or_else(|| {
+        let known: Vec<&String> = state.names.keys().collect();
+        format!(
+            "no object named `{target}` (registered names: {}; NEW ... AS <name> creates \
+             one; positional paths are objN.field, contactK.field, system.field)",
+            if known.is_empty() { "none".to_string() } else { format!("{known:?}") }
+        )
+    })
+}
+
+/// Extracts a dumbbell's user-facing members from `(mass, boundary)`:
+/// `(m1, m2, m_rod, r1, r2, rod_radius, length)` — the mass fractions
+/// stored in the boundary make every part recoverable.
+fn dumbbell_members(o: &physical_object) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
+    match o.get_boundary() {
+        Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, f1, f2 } => {
+            let m = o.get_mass();
+            Some((f1 * m, f2 * m, (1.0 - f1 - f2) * m, r1, r2, rod_radius, z2 - z1))
+        }
+        _ => None,
+    }
+}
+
+/// Rewrites one dumbbell member and rebuilds the body: total mass, COM
+/// offsets and the inertia tensor all follow (the object's position —
+/// its COM — and velocities are untouched).
+fn dumbbell_member_write(
+    o: &mut physical_object,
+    field: &str,
+    v: f64,
+) -> Result<(), String> {
+    let (mut m1, mut m2, mut m_rod, mut r1, mut r2, mut rod_r, mut len) =
+        dumbbell_members(o).ok_or_else(|| "not a dumbbell".to_string())?;
+    match field {
+        "m1" => m1 = v,
+        "m2" => m2 = v,
+        "m_rod" => m_rod = v,
+        "r1" => r1 = v,
+        "r2" => r2 = v,
+        "rod_radius" | "rod_r" => rod_r = v,
+        "length" | "len" => len = v,
+        _ => return Err(format!("`{field}` is not a dumbbell member")),
+    }
+    let (mass, b) = ::physical_object::boundary::dumbbell(m1, m2, m_rod, r1, r2, rod_r, len)?;
+    o.set_mass(mass);
+    o.set_boundary(b);
+    o.recompute_inertia_from_boundary();
     Ok(())
 }
 
@@ -832,6 +1190,7 @@ fn exec_box(mode: BoxMode, state: &mut SimState, stack: &mut Vec<Value>) -> Resu
         idx.sort_unstable();
         for &i in idx.iter().rev() {
             state.system.remove_object(i);
+            unregister_index(&mut state.names, i);
         }
         state.wall_indices.clear();
         state.box_size = None;
@@ -940,7 +1299,7 @@ fn exec_scene(cmd: &SceneCmd, state: &mut SimState, stack: &mut Vec<Value>) -> R
             ));
         }
         let handle = SceneHandle::start(state.system.clone(), *port, state.machine_mode, true)?;
-        handle.set_box(state.box_size, &state.wall_indices)?;
+        handle.set_box(state.box_size, &state.wall_indices, &state.names)?;
         let url = handle.url.clone();
         state.scene = Some(handle);
         return Ok(format!(
@@ -989,7 +1348,7 @@ fn exec_scene(cmd: &SceneCmd, state: &mut SimState, stack: &mut Vec<Value>) -> R
         SceneCmd::Show(which) => scene.set_visibility(*which, false),
         SceneCmd::Refresh => {
             scene.sync(&state.system)?;
-            scene.set_box(state.box_size, &state.wall_indices)?;
+            scene.set_box(state.box_size, &state.wall_indices, &state.names)?;
             Ok(format!(
                 "scene refreshed from the notebook state ({} entities, t = {})",
                 state.system.objects.len(),
@@ -1003,6 +1362,7 @@ fn exec_scene(cmd: &SceneCmd, state: &mut SimState, stack: &mut Vec<Value>) -> R
         SceneCmd::Start => scene.set_mode(RunMode::Running),
         SceneCmd::Stop => scene.set_mode(RunMode::Stopped),
         SceneCmd::Pause => scene.set_mode(RunMode::Paused),
+        SceneCmd::ResetPlayback => scene.reset_playback(),
         SceneCmd::Reverse => scene.set_mode(RunMode::Reversing),
         SceneCmd::SetTimeStep => {
             let dt = pop_num(stack)?;
@@ -1048,6 +1408,259 @@ fn binary_mul(a: Value, b: Value) -> Result<Value, String> {
             type_name(&b)
         )),
     }
+}
+
+/// Names taken by the expression builtins — a user function may not
+/// shadow them.
+const BUILTIN_NAMES: &[&str] =
+    &["dot", "cross", "norm", "normalize", "sqrt", "abs", "sin", "cos", "exp", "log"];
+
+/// Maximum user-function call depth (a plain safety net — the language
+/// has no conditionals, so recursion can never terminate anyway).
+const MAX_CALL_DEPTH: usize = 32;
+
+/// Executes a user-defined function: binds arguments (missing trailing
+/// ones take their defaults), pushes a call frame, runs the body lines
+/// through the ordinary compile/execute pipeline, and returns the last
+/// line's value.
+fn call_user_function(name: &str, args: Vec<Value>, state: &mut SimState) -> Result<Value, String> {
+    let f = state.functions.get(name).cloned().expect("caller checked");
+    if args.len() > f.params.len() {
+        return Err(format!(
+            "{name}() takes at most {} argument(s), got {} — signature: {name}({})",
+            f.params.len(),
+            args.len(),
+            f.params
+                .iter()
+                .map(|(p, d)| match d {
+                    Some(v) => format!("{p} = {v}"),
+                    None => p.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if state.env_stack.len() >= MAX_CALL_DEPTH {
+        return Err(format!("function call depth limit ({MAX_CALL_DEPTH}) exceeded"));
+    }
+    let mut env = BTreeMap::new();
+    for (k, (pname, default)) in f.params.iter().enumerate() {
+        let v = if k < args.len() {
+            args[k].clone()
+        } else if let Some(d) = default {
+            d.clone()
+        } else {
+            return Err(format!(
+                "{name}(): missing argument `{pname}` (it has no default)"
+            ));
+        };
+        env.insert(pname.clone(), v);
+    }
+    state.env_stack.push(env);
+    let mut last = Value::Unit;
+    for line in &f.body {
+        match crate::parser::compile_line(line).and_then(|prog| execute(&prog, state)) {
+            Ok(v) => last = v,
+            Err(e) => {
+                state.env_stack.pop();
+                return Err(format!("{name}(): {e}\n  in body line: {line}"));
+            }
+        }
+    }
+    state.env_stack.pop();
+    Ok(last)
+}
+
+/// True when a source line is the DEF line form (handled before the
+/// ordinary grammar).
+pub fn is_def_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.len() >= 4
+        && t[..3].eq_ignore_ascii_case("def")
+        && t.as_bytes()[3].is_ascii_whitespace()
+}
+
+/// Splits `text` on `sep` at brace/bracket/paren depth 0, outside
+/// string literals.
+fn split_top_level(text: &str, sep: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut prev_escape = false;
+    for c in text.chars() {
+        if in_str {
+            cur.push(c);
+            if prev_escape {
+                prev_escape = false;
+            } else if c == '\\' {
+                prev_escape = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                cur.push(c);
+            }
+            '{' | '[' | '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' | ']' | ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            c if c == sep && depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+            }
+            c => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    parts
+}
+
+/// Parses and installs a `DEF name(param [= default], ...) { body }`
+/// definition. The body is captured as source lines; every line is
+/// compile-checked NOW (correct syntax at definition time), defaults
+/// are evaluated now, and redefinition replaces the previous version
+/// (that is how a function is edited: SHOW it, adjust, re-DEF).
+pub fn define_function(source: &str, state: &mut SimState) -> Result<Value, String> {
+    /* split off the header at the first top-level '{' */
+    let mut brace = None;
+    {
+        let mut in_str = false;
+        let mut prev_escape = false;
+        for (i, c) in source.char_indices() {
+            if in_str {
+                if prev_escape {
+                    prev_escape = false;
+                } else if c == '\\' {
+                    prev_escape = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' => {
+                    brace = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some(open) = brace else {
+        return Err("DEF needs a `{ body }` block: DEF name(params) { commands }".to_string());
+    };
+    let close = source.rfind('}').ok_or_else(|| "DEF: missing the closing `}`".to_string())?;
+    if close < open {
+        return Err("DEF: the closing `}` comes before the opening `{`".to_string());
+    }
+    let header = &source[..open];
+    let body_text = &source[open + 1..close];
+    let trailer = source[close + 1..].trim();
+    if !trailer.is_empty() && !trailer.starts_with('#') {
+        return Err(format!("DEF: unexpected text after the closing brace: `{trailer}`"));
+    }
+
+    /* header: def NAME ( params ) */
+    let ht = header.trim();
+    let after_def = ht[3..].trim_start();
+    let lp = after_def
+        .find('(')
+        .ok_or_else(|| "DEF needs a parameter list: DEF name(params) { ... }".to_string())?;
+    let fname = after_def[..lp].trim().to_ascii_lowercase();
+    let valid_name = !fname.is_empty()
+        && fname.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && fname.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid_name {
+        return Err(format!("DEF: `{fname}` is not a valid function name"));
+    }
+    if BUILTIN_NAMES.contains(&fname.as_str()) {
+        return Err(format!("DEF: `{fname}` is a builtin function and cannot be redefined"));
+    }
+    /* the name must lex as a plain identifier — a keyword (NEW, BOX,
+     * SHOW, ...) could never be called back */
+    match crate::lexer::tokenize(&fname) {
+        Ok(toks)
+            if toks.len() == 1 && matches!(toks[0].kind, crate::lexer::TokKind::Ident(_)) => {}
+        _ => {
+            return Err(format!(
+                "DEF: `{fname}` is a reserved word and cannot name a function"
+            ))
+        }
+    }
+    let params_text = after_def[lp + 1..]
+        .trim_end()
+        .strip_suffix(')')
+        .ok_or_else(|| "DEF: the parameter list is missing its `)`".to_string())?;
+    let mut params: Vec<(String, Option<Value>)> = Vec::new();
+    if !params_text.trim().is_empty() {
+        for part in split_top_level(params_text, ',') {
+            let part = part.trim();
+            let (pname, default) = match part.split_once('=') {
+                Some((n, d)) => (n.trim(), Some(d.trim())),
+                None => (part, None),
+            };
+            let ok = !pname.is_empty()
+                && pname.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && pname.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !ok {
+                return Err(format!("DEF {fname}: `{pname}` is not a valid parameter name"));
+            }
+            let dval = match default {
+                None => None,
+                Some(d) => {
+                    /* defaults are ordinary expressions, evaluated once
+                     * NOW (LET variables are visible) */
+                    let prog = crate::parser::compile_line(d)
+                        .map_err(|e| format!("DEF {fname}: default for `{pname}`: {e}"))?;
+                    Some(execute(&prog, state).map_err(|e| {
+                        format!("DEF {fname}: default for `{pname}`: {e}")
+                    })?)
+                }
+            };
+            params.push((pname.to_ascii_lowercase(), dval));
+        }
+    }
+
+    /* body: newline- and ;-separated commands, each compile-checked */
+    let mut body = Vec::new();
+    for raw_line in body_text.lines() {
+        for cmd in split_top_level(raw_line, ';') {
+            let cmd = cmd.trim();
+            if cmd.is_empty() || cmd.starts_with('#') {
+                continue;
+            }
+            if is_def_line(cmd) {
+                return Err(format!("DEF {fname}: nested DEF is not allowed"));
+            }
+            crate::parser::compile_line(cmd)
+                .map_err(|e| format!("DEF {fname}: body line `{cmd}`: {e}"))?;
+            body.push(cmd.to_string());
+        }
+    }
+    if body.is_empty() {
+        return Err(format!("DEF {fname}: the body is empty"));
+    }
+
+    let redefined = state.functions.contains_key(&fname);
+    let nparams = params.len();
+    let nlines = body.len();
+    state.functions.insert(
+        fname.clone(),
+        FuncDef { params, body, source: source.trim().to_string() },
+    );
+    Ok(Value::Str(format!(
+        "function {fname}({nparams} parameter(s)) defined — {nlines} body line(s){}",
+        if redefined { " (redefined)" } else { "" }
+    )))
 }
 
 fn call_builtin(name: &str, mut args: Vec<Value>) -> Result<Value, String> {
@@ -1141,6 +1754,13 @@ fn apply_comp(base: Value, comp: Option<usize>, path: &Path) -> Result<Value, St
 }
 
 fn load_path(state: &SimState, path: &Path) -> Result<Value, String> {
+    if let PathRoot::Named(n) = &path.root {
+        let i = resolve_name(state, n)?;
+        return load_path(
+            state,
+            &Path { root: PathRoot::Object(i), field: path.field.clone(), comp: path.comp },
+        );
+    }
     let base = match &path.root {
         PathRoot::System => match path.field.as_str() {
             "g_constant" | "g" => Value::Num(state.system.g_constant),
@@ -1171,6 +1791,37 @@ fn load_path(state: &SimState, path: &Path) -> Result<Value, String> {
             let o = get_object(state, *i)?;
             match path.field.as_str() {
                 "id" => Value::Num(o.get_id() as f64),
+                /* component shorthands: name.x, name.vx, ... */
+                "x" => Value::Num(o.get_position().x),
+                "y" => Value::Num(o.get_position().y),
+                "z" => Value::Num(o.get_position().z),
+                "vx" => Value::Num(o.get_velocity().x),
+                "vy" => Value::Num(o.get_velocity().y),
+                "vz" => Value::Num(o.get_velocity().z),
+                /* dumbbell members (part masses recoverable from the
+                 * stored mass fractions) */
+                "m1" | "m2" | "m_rod" if matches!(o.get_boundary(), Boundary::Dumbbell { .. }) => {
+                    let (m1, m2, m_rod, ..) = dumbbell_members(o).expect("checked");
+                    Value::Num(match path.field.as_str() {
+                        "m1" => m1,
+                        "m2" => m2,
+                        _ => m_rod,
+                    })
+                }
+                "r1" | "r2" if matches!(o.get_boundary(), Boundary::Dumbbell { .. }) => {
+                    let (_, _, _, r1, r2, ..) = dumbbell_members(o).expect("checked");
+                    Value::Num(if path.field == "r1" { r1 } else { r2 })
+                }
+                "rod_radius" | "rod_r"
+                    if matches!(o.get_boundary(), Boundary::Dumbbell { .. }) =>
+                {
+                    let (.., rod_r, _) = dumbbell_members(o).expect("checked");
+                    Value::Num(rod_r)
+                }
+                "length" | "len" if matches!(o.get_boundary(), Boundary::Dumbbell { .. }) => {
+                    let (.., len) = dumbbell_members(o).expect("checked");
+                    Value::Num(len)
+                }
                 "mass" => Value::Num(o.get_mass()),
                 "inverse_mass" => Value::Num(o.get_inverse_mass()),
                 "charge" => Value::Num(o.get_charge()),
@@ -1265,11 +1916,20 @@ fn load_path(state: &SimState, path: &Path) -> Result<Value, String> {
                 }
             }
         }
+        PathRoot::Named(_) => unreachable!("named roots resolve to Object above"),
     };
     apply_comp(base, path.comp, path)
 }
 
 fn store_path(state: &mut SimState, path: &Path, value: Value) -> Result<(), String> {
+    if let PathRoot::Named(n) = &path.root {
+        let i = resolve_name(state, n)?;
+        return store_path(
+            state,
+            &Path { root: PathRoot::Object(i), field: path.field.clone(), comp: path.comp },
+            value,
+        );
+    }
     /* component store: read-modify-write through the full-field API */
     if let Some(c) = path.comp {
         let full = Path { comp: None, ..path.clone() };
@@ -1356,6 +2016,55 @@ fn store_path(state: &mut SimState, path: &Path, value: Value) -> Result<(), Str
                 "id" => {
                     let n = num(value)?;
                     state.system.objects[i].set_id(n as usize);
+                }
+                "x" | "y" | "z" => {
+                    let n = num(value)?;
+                    let o = &mut state.system.objects[i];
+                    let mut pos = o.get_position();
+                    match path.field.as_str() {
+                        "x" => pos.x = n,
+                        "y" => pos.y = n,
+                        _ => pos.z = n,
+                    }
+                    o.set_position(pos);
+                }
+                "vx" | "vy" | "vz" => {
+                    let n = num(value)?;
+                    let o = &mut state.system.objects[i];
+                    let mut vel = o.get_velocity();
+                    match path.field.as_str() {
+                        "vx" => vel.x = n,
+                        "vy" => vel.y = n,
+                        _ => vel.z = n,
+                    }
+                    o.set_velocity(vel);
+                }
+                "m1" | "m2" | "m_rod"
+                    if matches!(
+                        state.system.objects[i].get_boundary(),
+                        Boundary::Dumbbell { .. }
+                    ) =>
+                {
+                    let n = num(value)?;
+                    dumbbell_member_write(&mut state.system.objects[i], path.field.as_str(), n)?;
+                }
+                "r1" | "r2" | "rod_r"
+                    if matches!(
+                        state.system.objects[i].get_boundary(),
+                        Boundary::Dumbbell { .. }
+                    ) =>
+                {
+                    let n = num(value)?;
+                    dumbbell_member_write(&mut state.system.objects[i], path.field.as_str(), n)?;
+                }
+                "rod_radius" | "length" | "len"
+                    if matches!(
+                        state.system.objects[i].get_boundary(),
+                        Boundary::Dumbbell { .. }
+                    ) =>
+                {
+                    let n = num(value)?;
+                    dumbbell_member_write(&mut state.system.objects[i], path.field.as_str(), n)?;
                 }
                 "mass" => {
                     let n = num(value)?;
@@ -1530,12 +2239,18 @@ fn store_path(state: &mut SimState, path: &Path, value: Value) -> Result<(), Str
                  solver already resolved"
             ))
         }
+        PathRoot::Named(_) => unreachable!("named roots resolve to Object above"),
     }
     Ok(())
 }
 
-/// Convenience: lex + parse + execute one command line.
+/// Convenience: lex + parse + execute one command line. `DEF` is a
+/// line form handled here, before the expression grammar (its body may
+/// span multiple lines — the notebook joins them).
 pub fn execute_line(line: &str, state: &mut SimState) -> Result<Value, String> {
+    if is_def_line(line) {
+        return define_function(line, state);
+    }
     let prog = crate::parser::compile_line(line)?;
     execute(&prog, state)
 }
@@ -1866,6 +2581,90 @@ mod tests {
             Value::Str(s) => assert!(s.contains("Torus"), "still a torus: {s}"),
             v => panic!("expected string, got {v}"),
         }
+    }
+
+    #[test]
+    fn def_call_named_objects_and_dumbbell_members() {
+        let mut st = SimState::default();
+        // Multi-line DEF with defaults; every body line syntax-checked.
+        let def_src = "def create_dumbell(name, m1 = 1, m2 = 1, m_rod = 0.5, r1 = 0.25, \
+                       r2 = 0.25, rod_radius = 0.1, length = 1, position = [0, 0, 0], \
+                       velocity = [0, 0, 0], angular_velocity = [0, 0, 0]) {\n  \
+                       new dumbbell as name { m1 = m1, m2 = m2, m_rod = m_rod, r1 = r1, \
+                       r2 = r2, rod_radius = rod_radius, length = length, \
+                       position = position, velocity = velocity, \
+                       angular_velocity = angular_velocity }\n}";
+        match execute_line(def_src, &mut st).unwrap() {
+            Value::Str(m) => assert!(m.contains("11 parameter(s)"), "{m}"),
+            v => panic!("expected string, got {v}"),
+        }
+        // Call with a string name + partial arguments (defaults fill in).
+        assert_eq!(
+            execute_line("create_dumbell(\"dumbell0\", 1, 2, 0.5)", &mut st).unwrap(),
+            Value::Str("obj0 as dumbell0".to_string())
+        );
+        assert_eq!(execute_line("get dumbell0.m1", &mut st).unwrap(), Value::Num(1.0));
+        assert_eq!(execute_line("get dumbell0.m2", &mut st).unwrap(), Value::Num(2.0));
+        match execute_line("get dumbell0.m_rod", &mut st).unwrap() {
+            Value::Num(m) => assert!((m - 0.5).abs() < 1e-12),
+            v => panic!("expected number, got {v}"),
+        }
+        assert_eq!(execute_line("get dumbell0.mass", &mut st).unwrap(), Value::Num(3.5));
+
+        // Component shorthands on named paths.
+        execute_line("set dumbell0.vx = 1.5", &mut st).unwrap();
+        assert_eq!(execute_line("get dumbell0.vx", &mut st).unwrap(), Value::Num(1.5));
+        assert_eq!(execute_line("get dumbell0.x", &mut st).unwrap(), Value::Num(0.0));
+
+        // Member writes rebuild the body: mass, offsets, inertia.
+        execute_line("set dumbell0.m1 = 3", &mut st).unwrap();
+        assert_eq!(execute_line("get dumbell0.mass", &mut st).unwrap(), Value::Num(5.5));
+        assert_eq!(execute_line("get dumbell0.length", &mut st).unwrap(), Value::Num(1.0));
+
+        // Names renumber on DEL: a second named object survives.
+        execute_line("new sphere as ball { radius = 0.5, position = [3, 0, 0] }", &mut st)
+            .unwrap();
+        execute_line("del 0", &mut st).unwrap();
+        assert_eq!(execute_line("get ball.radius", &mut st).unwrap(), Value::Num(0.5));
+        let e = execute_line("get dumbell0.m1", &mut st).unwrap_err();
+        assert!(e.contains("no object named"), "{e}");
+
+        // Duplicate names are refused; reserved names are refused.
+        let e2 = execute_line("new sphere as ball", &mut st).unwrap_err();
+        assert!(e2.contains("already refers"), "{e2}");
+        let e3 = execute_line("new sphere as obj7", &mut st).unwrap_err();
+        assert!(e3.contains("reserved"), "{e3}");
+
+        // Editing = SHOW + re-DEF (replacement is reported).
+        match execute_line("show create_dumbell", &mut st).unwrap() {
+            Value::Str(src) => assert!(src.starts_with("def create_dumbell"), "{src}"),
+            v => panic!("expected string, got {v}"),
+        }
+        match execute_line(def_src, &mut st).unwrap() {
+            Value::Str(m) => assert!(m.contains("(redefined)"), "{m}"),
+            v => panic!("expected string, got {v}"),
+        }
+
+        // Argument arity errors are actionable.
+        let e4 = execute_line("create_dumbell()", &mut st).unwrap_err();
+        assert!(e4.contains("missing argument `name`"), "{e4}");
+
+        // LET variables feed calls and defaults.
+        execute_line("let heavy = 7", &mut st).unwrap();
+        execute_line("def probe(m = heavy) { new sphere { mass = m } }", &mut st).unwrap();
+        execute_line("probe()", &mut st).unwrap();
+        let n = st.system.objects.len();
+        assert_eq!(
+            execute_line(&format!("get obj{}.mass", n - 1), &mut st).unwrap(),
+            Value::Num(7.0)
+        );
+
+        // A failing body line rolls back and names the function.
+        execute_line("def bad() { new sphere { radius = -1 } }", &mut st).unwrap();
+        let before = st.system.objects.len();
+        let e5 = execute_line("bad()", &mut st).unwrap_err();
+        assert!(e5.contains("bad()"), "{e5}");
+        assert_eq!(st.system.objects.len(), before, "no ghost from a failing function");
     }
 
     #[test]

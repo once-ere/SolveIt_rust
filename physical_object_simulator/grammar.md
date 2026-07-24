@@ -45,6 +45,7 @@ whitespace. Everything from a `#` to the end of the line is a
 |---|---|---|
 | **keyword** | `NEW`, `set`, `Run` | case-insensitive; full list in §2.2 |
 | **identifier** | `obj0`, `position`, `mass` | a letter or `_`, then letters, digits, `_` |
+| **string** | `"ball"`, `"dumbell0"` | double-quoted, with the escapes `\"` `\\` `\n`; strings name objects (`NEW ... AS`, §5.1) and are passed to user functions (§5.9) |
 | **number** | `2`, `0.5`, `.5`, `1e-3`, `2.5E+4` | 64-bit floating point; scientific notation allowed; a leading `-` is *not* part of the number — it is the negation operator |
 | **punctuation** | `[ ] { } ( ) , . =` | brackets build vectors, braces enclose initializers, `.` builds dotted paths |
 | **operators** | `+ - * /` | ordinary arithmetic |
@@ -72,10 +73,18 @@ and, for rigid-body collisions (§5.7):
 
 `COLLIDE CONTACTS ON OFF`
 
+and, for named objects, session variables and user functions
+(§5.1, §5.9):
+
+`AS LET FUNCS DUMBBELL`
+
 (`DESTROY` is an alias for `CLOSE`; `SETTIMESTEP` for `SET_TIME_STEP`;
 the spellings `CUBE` and `DISC` are lexer aliases for `CUBOID` and
-`DISK`. `collisions` is deliberately **not** a keyword so that the
-field path `system.collisions` keeps its own spelling.)
+`DISK`; `FUNCTIONS` for `FUNCS`; and the single-b spelling `DUMBELL`
+for `DUMBBELL`. `collisions` is deliberately **not** a keyword so that
+the field path `system.collisions` keeps its own spelling. `DEF` is
+not a keyword either: a line starting `DEF ` is a **line form**
+recognized before the ordinary grammar — see §3 and §5.9.)
 
 Keywords are reserved *at the start of paths*, but **field names may
 reuse keyword spellings** — `obj0.momentum` and `system.method` work
@@ -100,60 +109,74 @@ The grammar in EBNF (Extended Backus–Naur Form — `[x]` means optional,
 ```ebnf
 line     := command | magic ;
 
-command  := "NEW" shape [ "{" init { "," init } "}" ]
+command  := "NEW" shape [ "AS" (IDENT | STRING) ]
+                         [ "{" init { "," init } "}" ]
+                                              (* AS registers a user
+                                                 name for the object *)
           | "SET" path "=" expr
           | "GET" path
           | "DEL" NUMBER
           | "LIST"
-          | "STEP" expr                        (* advance time by dt      *)
-          | "RUN" expr [ "STEPS" NUMBER ]      (* advance by t, n outputs *)
+          | "STEP" expr                       (* advance by dt      *)
+          | "RUN" expr [ "STEPS" NUMBER ]     (* advance by t, n outs *)
           | "METHOD" ( "ADAMS" | "BDF" | "SPRK" IDENT [ NUMBER ] )
           | "ENERGY" | "COM" | "MOMENTUM" | "ANGMOM"
           | "LAPLACE" NUMBER
-          | "RESET"
-          | "HELP"
-          | "SCENE" scenecmd                   (* graphical scene window  *)
-          | "COLLIDE" [ "ON" | "OFF" ]         (* bare: report status     *)
-          | "CONTACTS"                         (* contacts of last run    *)
-          | "BOX" [ "OFF" | expr ]             (* rigid bounding box:
-                                                  expr = inner side
-                                                  length; bare = status;
-                                                  OFF removes it          *)
-          | expr ;                             (* bare expression         *)
-
-scenecmd := "CREATE" [ NUMBER ]                (* open window [TCP port]  *)
-          | "CLOSE"                            (* alias: DESTROY          *)
-          | "TRANSLATE" term term [ term ]     (* camera dx dy [dz]       *)
-          | "ROTATE" term term                 (* camera dyaw dpitch, deg *)
-          | "ZOOM" ( "IN" | "OUT" | term )     (* factor > 1 zooms in     *)
-          | "HIDE" [ NUMBER | "ALL" ]          (* default: ALL            *)
+          | "RESET" | "HELP"
+          | "SCENE" scenecmd                  (* graphical scene     *)
+          | "COLLIDE" [ "ON" | "OFF" ]        (* bare: report status *)
+          | "CONTACTS"                        (* list last contacts  *)
+          | "LET" IDENT "=" expr              (* session variable    *)
+          | "FUNCS"                           (* list user functions *)
+          | "SHOW" IDENT                      (* print a function    *)
+          | "BOX" [ "OFF" | expr ]            (* rigid bounding box:
+                                                 expr = inner side
+                                                 length; bare = status;
+                                                 OFF removes it      *)
+          | expr ;                            (* bare expression     *)
+scenecmd := "CREATE" [ NUMBER ]               (* open window [port]  *)
+          | "CLOSE"                           (* aka DESTROY         *)
+          | "TRANSLATE" term term [ term ]    (* camera dx dy [dz]   *)
+          | "ROTATE" term term                (* camera dyaw dpitch  *)
+          | "ZOOM" ( "IN" | "OUT" | term )    (* factor > 1 zooms in *)
+          | "HIDE" [ NUMBER | "ALL" ]         (* default: ALL        *)
           | "SHOW" [ NUMBER | "ALL" ]
-          | "REFRESH"                          (* re-sync from notebook   *)
-          | "REDRAW"                           (* re-send whole scene     *)
+          | "REFRESH"                         (* re-sync from state  *)
+          | "REDRAW"                          (* re-send full scene  *)
           | "START" | "STOP" | "PAUSE" | "REVERSE"
-          | "SET_TIME_STEP" term
+          | "RESET"                           (* re-initialize: all
+                                                 values and the time
+                                                 return to initial;
+                                                 START re-starts    *)
+          | "SET_TIME_STEP" term              (* args are term-level:
+                                                 -5 is negative five;
+                                                 parenthesize sums  *)
           | "STATUS" | "EVENTS" ;
+shape    := "POINT" | "SPHERE" | "CUBOID" | "TORUS" | "DISK" | "CYLINDER"
+          | "DUMBBELL" ;                      (* two solid spheres +
+                                                 a rigid rod, one
+                                                 rigid body          *)
 
-shape    := "POINT" | "SPHERE" | "CUBOID" | "TORUS" | "DISK" | "CYLINDER" ;
-init     := FIELD "=" expr ;
-
-path     := root "." FIELD [ "." COMPONENT ] ;
-root     := "objN"           (* N = object index, e.g. obj0, obj12 *)
-          | "contactK"       (* K = contact index of the last run  *)
-          | "system" | "sys" ;
-COMPONENT:= "x" | "y" | "z" | "w" ;
-
-expr     := term  { ("+" | "-") term  } ;
+(* User-defined functions are a LINE FORM handled before this
+   grammar: DEF name(param [= default], ...) { body } — the body is
+   newline/;-separated commands using the parameters as variables;
+   each body line must itself satisfy this grammar. Invocation uses
+   the ordinary call syntax name(arg, ...); trailing parameters
+   take their defaults. *)
+init     := IDENT "=" expr ;
+path     := IDENT { "." IDENT } ;             (* objN.field[.x|y|z|w],
+                                                 system.field,
+                                                 contactK.field,
+                                                 name.field for
+                                                 AS-registered names *)
+expr     := term { ("+" | "-") term } ;
 term     := unary { ("*" | "/") unary } ;
 unary    := "-" unary | atom ;
-atom     := NUMBER
-          | "[" expr { "," expr } "]"          (* vector/matrix literal  *)
-          | "(" expr ")"
-          | FUNC "(" [ expr { "," expr } ] ")" (* builtin function call  *)
+atom     := NUMBER | STRING | "[" expr { "," expr } "]" | "(" expr ")"
+          | IDENT "(" [ expr { "," expr } ] ")"   (* builtin or user
+                                                     function call   *)
           | path
-          | "pi" | "tau" ;
-FUNC     := "dot" | "cross" | "norm" | "normalize"
-          | "sqrt" | "abs" | "sin" | "cos" | "exp" | "log" ;
+          | IDENT ;                           (* parameter / LET var *)
 ```
 
 Operator precedence is the usual one: `*` and `/` bind tighter than `+`
@@ -182,6 +205,17 @@ scene zoom (1 + 0.5)           # a sum needs parentheses
 scene translate 2*2 0 1/2      # * and / are fine unparenthesized
 ```
 
+**A third subtlety — bare identifiers compile and resolve at
+execution.** An `IDENT` alone is an ordinary atom: the constants `pi`
+and `tau`, a function parameter, or a `LET` variable (§5.9). The name
+is looked up when the line *runs*, not when it parses, so a function
+body may use parameters freely; a name that is bound to nothing fails
+at execution with an error that lists the three ways to bind one
+(`LET`, a parameter, or a registered object's `name.field` path —
+§10). A call `IDENT(...)` is a builtin (`dot`, `cross`, `norm`,
+`normalize`, `sqrt`, `abs`, `sin`, `cos`, `exp`, `log`) when the name
+matches one, and a user-defined function otherwise.
+
 ---
 
 ## 4. The type system (what values exist)
@@ -194,7 +228,7 @@ Every expression evaluates to one of these **values**:
 | **vec3** | `[1, 2, 3]` | exactly 3 numeric entries |
 | **quaternion** | `[w, x, y, z]` | exactly 4 numeric entries, **w first**; assigned to `orientation` it is automatically renormalized to unit length |
 | **mat3** | `[[a,b,c],[d,e,f],[g,h,i]]` | 3 rows of 3 numbers (a vector of 3 vec3s) |
-| **string** | *(produced, not typed)* | results like `obj0` or run summaries |
+| **string** | `"ball"` | a double-quoted literal (§2.1) — names objects (`NEW ... AS`) and feeds user functions; also produced as results like `obj0` or run summaries |
 
 Bracket literals are **shape-directed**: 3 numbers make a vec3,
 4 numbers make a quaternion, 3 vec3s make a mat3. Anything else stays a
@@ -227,6 +261,9 @@ NEW CUBOID   { field = expr, ... }        (alias: NEW CUBE)
 NEW TORUS    { field = expr, ... }
 NEW DISK     { field = expr, ... }        (alias: NEW DISC)
 NEW CYLINDER { field = expr, ... }
+NEW DUMBBELL { field = expr, ... }        (alias: NEW DUMBELL)
+
+NEW <shape> AS <name> { field = expr, ... }   (register a user name)
 ```
 
 Creates one **physical object** and prints its handle (`obj0`, `obj1`,
@@ -234,13 +271,15 @@ Creates one **physical object** and prints its handle (`obj0`, `obj1`,
 optional list of initializers. Defaults: mass 1, at the origin, at
 rest, no charge; sphere radius 1; cuboid half-extents `[1,1,1]`;
 torus ring_radius 1, tube_radius 0.25; disk radius 1; cylinder
-radius 0.5, half_height 1.
+radius 0.5, half_height 1; dumbbell m1 = 1, m2 = 1, m_rod = 0.5,
+r1 = 0.25, r2 = 0.25, rod_radius = 0.1, length = 1 (total mass 2.5).
 
 Initializer fields: `mass, charge, position, velocity, momentum,
 orientation, angular_velocity, angular_momentum, radius (spheres,
 disks, cylinders), half_extents (cuboids), ring_radius, tube_radius
 (tori — or the inner_radius + outer_radius pair, see below), height,
 half_height (cylinders; HEIGHT is the full height = 2·half_height),
+m1, m2, m_rod, r1, r2, rod_radius, length (dumbbells, see below),
 inertia_tensor, inverse_inertia_tensor, magnetic_moment_tensor, force,
 torque, id, inverse_mass`.
 
@@ -262,6 +301,43 @@ in either order too (checking each write against the half-updated
 default would have refused one of the two orders). `inner_radius = 0`
 is legal — that is the **horn torus**, whose tube touches the axis —
 on `NEW` and on `SET` alike.
+
+**The dumbbell** is ONE rigid body: two solid spheres joined by a
+solid rod. Its seven part fields are `m1`, `m2`, `m_rod` (the two
+sphere masses and the rod mass), `r1`, `r2` (the sphere radii),
+`rod_radius` (alias `rod_r`) and `length` (alias `len` — the distance
+between the sphere centers). Like the torus radius pair, the part
+fields are **deferred**: they are collected during the initializer
+list and resolved *once* at its end, so they are order-independent
+and validated once against the final values. The constructor places
+the local origin at the composite **center of mass** — the sphere
+centers sit at `z1 = −(m2 + m_rod/2)·L/M` and
+`z2 = +(m1 + m_rod/2)·L/M` on the body z-axis, which makes
+`m1·z1 + m2·z2 + m_rod·(z1+z2)/2 = 0` an identity — so `position` is
+the COM, exactly as for every other shape. The inertia tensor is the
+exact composite (solid-sphere `2/5 m r²` terms with parallel-axis
+shifts, plus the rod), and the surface is the exact union of the
+three parts. It is the simulator's first non-centrally-symmetric
+shape; collisions against every other shape decompose exactly over
+its parts (see `collision_detection.md`). The part fields remain
+readable *and writable* after creation (§5.2).
+
+**`AS` registers a user name for the object.** The name is a string
+literal (`NEW SPHERE AS "ball"`) or a bare identifier
+(`NEW SPHERE AS ball`); a bare identifier is first resolved against a
+function parameter or `LET` variable holding a string — so a function
+can name the object it creates from its argument (§5.9, Example 14) —
+and otherwise the identifier's own spelling is the name. The reply
+shows both handles: `obj0 as ball`. Named paths then work everywhere
+a positional path does — `ball.mass`, `dumbell0.position.x`, in
+`SET`/`GET` and in bare expressions. Names are case-insensitive
+identifiers; `system`/`sys` and the positional spellings are refused
+(`` `system` is reserved ``, `` `obj7` is reserved for positional
+paths ``), and so are duplicates (`` the name `d` already refers to
+obj0 — DEL it or pick another name ``). The registry follows every
+renumbering: `DEL` removes the deleted object's name and shifts the
+names of higher-numbered objects down with their objects, and the
+`BOX` commands do the same when walls come and go.
 
 Four guarantees make initializers forgiving:
 
@@ -289,10 +365,15 @@ Four guarantees make initializers forgiving:
 SET <path> = <expr>          GET <path>
 ```
 
-A **path** is `objN.field`, `system.field` or `contactK.field` (§5.7),
+A **path** is `objN.field`, `system.field`, `contactK.field` (§5.7)
+or `name.field` for a name registered with `NEW ... AS` (§5.1),
 optionally followed by a component: `.x`, `.y`, `.z` (vectors) or `.w`,
 `.x`, `.y`, `.z` (quaternions). Component writes are safe
 read-modify-write operations through the full field's get/set pair.
+Every object also has six **component shorthands**: `.x .y .z` read
+and write the position components and `.vx .vy .vz` the velocity
+components — `ball.x` is `ball.position.x`, `SET ball.vx = 2` is a
+velocity write.
 
 **Object fields** (R = readable, W = writable):
 
@@ -316,6 +397,11 @@ read-modify-write operations through the full field's get/set pair.
 | `ring_radius`, `tube_radius` | number | RW | tori only; writing recomputes inertia |
 | `inner_radius`, `outer_radius` | number | RW | tori only, derived (inner = c − a, outer = c + a); writing one holds the other fixed; `inner_radius` accepts **≥ 0** (0 = the horn torus; the other radii must be > 0) |
 | `height`, `half_height` | number | RW | cylinders only; `height` is the full height (= 2·`half_height`); writing recomputes inertia |
+| `m1`, `m2`, `m_rod` | number | RW | dumbbells only: the two sphere masses and the rod mass; writing rebuilds the body — total mass, the COM offsets and the inertia tensor all follow (position and velocities are untouched) |
+| `r1`, `r2`, `rod_radius` | number | RW | dumbbells only: the sphere radii and the rod radius (alias `rod_r`); same rebuild on write |
+| `length` | number | RW | dumbbells only: distance between the sphere centers (alias `len`); same rebuild on write |
+| `x`, `y`, `z` | number | RW | every object: shorthands for `position.x/.y/.z` |
+| `vx`, `vy`, `vz` | number | RW | every object: shorthands for `velocity.x/.y/.z` |
 | `boundary`, `shape` | string | R | description of the shape |
 | `kinetic_energy`, `energy` | number | R | `½m|v|² + ½ω·L` |
 | `force` | vec3 | RW | constant external force applied during `STEP`/`RUN` |
@@ -392,7 +478,7 @@ refuses with an error *naming the offending feature* and suggesting
 | `LAPLACE n` | the Laplace–Runge–Lenz vector of object n about the system's center of mass, with `k = G·M_total` |
 | `LIST` | one line per object |
 | `DEL n` | removes object n (**later objects renumber!**) |
-| `RESET` | wipes everything back to an empty system (an open scene window survives and re-syncs to the now-empty system — its box wireframe and wall flags are cleared too, §5.8) |
+| `RESET` | wipes everything back to an empty system (an open scene window survives and re-syncs to the now-empty system — its box wireframe and wall flags are cleared too, §5.8). Not to be confused with `SCENE RESET`, which re-initializes only the window's playback copy (§5.6) |
 | `HELP` | the quick-reference card |
 
 ### 5.6 `SCENE` — the graphical scene window
@@ -401,8 +487,9 @@ refuses with an error *naming the offending feature* and suggesting
 standard library — no external dependencies) and opens a page in your
 web browser. That page **is** the scene window: it draws every
 simulator entity on a 3-D canvas, has a **toolbar** (Start, Pause,
-Stop, Reverse, single-step, a dt box, zoom, view reset, grid/trails/
-labels toggles, help) and a **status bar** (connection light, playback
+Stop, Reverse, a permanent ↺ Reset button, single-step, a dt box,
+zoom, view reset, grid/trails/labels toggles, help) and a **status
+bar** (connection light, playback
 mode, simulation time, dt, total energy, body count, hidden count,
 history depth, camera readout, frames per second). Inside the window:
 
@@ -434,6 +521,7 @@ The same controls are scriptable from the notebook:
 | `SCENE PAUSE` | freeze; `START` resumes, history is kept |
 | `SCENE STOP` | halt **and clear the recorded history** |
 | `SCENE REVERSE` | play **backward in time** through the recorded history |
+| `SCENE RESET` | **re-initialize the playback**: every mutable value and the time return to their initial values — the state last synced at `CREATE`/`REFRESH`, restored bit-identically — history and the step counter clear, and the mode returns to *stopped*; `START` then re-runs the simulation from the beginning. The window's permanent toolbar **↺ Reset** button does exactly the same (both call one primitive) |
 | `SCENE SET_TIME_STEP dt` | set the playback time step (must be positive and finite) |
 | `SCENE STATUS` | a four-line report: URL + connected windows; mode/t/dt/steps/history; entities + hidden list; camera |
 | `SCENE EVENTS` | print (and clear) the asynchronous messages the window has sent: errors, connect/disconnect notices, toolbar actions, data requests |
@@ -449,7 +537,16 @@ engine in the window.
 **Playback is a four-state machine** (`stopped → running ⇄ paused`,
 plus `reversing`): `STOP` clears history and a later `START` begins
 fresh; `PAUSE` keeps history so both `START` (forward) and `REVERSE`
-(backward) can continue from the freeze point.
+(backward) can continue from the freeze point. `RESET` is stronger
+than `STOP`: besides clearing history it puts every value back to its
+initial state, so the next `START` replays the simulation from the
+very beginning rather than continuing from wherever playback halted.
+The reply confirms it:
+
+```
+In[6]:= scene reset
+Out[6]= scene playback reset to its initial state (t = 0, 1 entity); Start runs the simulation again from the beginning
+```
 
 **How REVERSE works.** While running forward, the playback thread
 records a snapshot of the whole system before every step (a ring
@@ -588,6 +685,105 @@ Bookkeeping:
   an open window to the now-empty system **and clears its box
   wireframe and wall flags** — no stale overlay survives the wipe.
 
+### 5.9 User definitions: `DEF`, `LET`, `FUNCS`, `SHOW`
+
+```
+DEF name(param [= default], ...) { body }     (define a function)
+name(arg, ...)                                (call it)
+LET name = <expr>                             (session variable)
+FUNCS                                         (list signatures; alias: FUNCTIONS)
+SHOW name                                     (print a function's source)
+```
+
+**`DEF` is a line form, not a grammar production.** A line that starts
+with `DEF ` is recognized *before* the ordinary grammar (§3): the
+notebook captures everything up to the closing `}` — interactively it
+keeps prompting `  ...:= ` for continuation lines until the brace
+closes; scripts and JupyterLab cells just keep reading — and installs
+the function. The **body** is a sequence of ordinary commands,
+separated by newlines or `;`, in which the parameters act as
+variables. **Every body line is syntax-checked at definition time**
+(a typo fails the `DEF` immediately, naming the body line), and
+**defaults are ordinary expressions evaluated once, at definition**
+(`LET` variables are visible in them).
+
+**Calling** uses the ordinary call syntax `name(arg, ...)` — the same
+atom as `sqrt(2)`; a name that is not a builtin is looked up among
+your functions. Missing trailing arguments take their defaults (an
+argument with no default must be supplied). Each call pushes a **call
+frame** binding the parameters (depth cap: 32 — the language has no
+conditionals, so recursion could never terminate anyway) and runs the
+body lines through the same compile-and-execute pipeline as typed
+input. The call **returns the last body line's value** — if that line
+is a `SET`, the call prints no `Out[n]`, exactly like `SET` itself. A
+failing body line aborts the call and the error names the function
+*and* the line; lines that already ran keep their effects (each
+command's own guarantees still hold per line — e.g. a failing `NEW`
+inside a body is still transactional), so a partly-run call leaves no
+half-built object, only completed commands.
+
+**Editing is `SHOW` + re-`DEF`.** `SHOW name` prints the definition
+verbatim, exactly as you typed it; redefining the same name replaces
+the old version and the reply appends `(redefined)`. `FUNCS` lists
+every signature with its defaults.
+
+**`LET name = expr`** binds a session variable (reply: `name set`).
+It is visible in bare expressions, in function bodies, in `DEF`
+defaults — and, holding a string, it can *name* things: `NEW ... AS`
+and named paths resolve a bare identifier through the parameter/`LET`
+bindings first (§5.1). Note `GET` takes only a *path* (§3), so a
+variable is read back as a bare expression: `g0`, not `GET g0`.
+
+A complete session (genuine output):
+
+```
+In[1]:= let g0 = 9.81
+Out[1]= g0 set
+In[2]:= def drop(name, m = 1, h = 10) {
+  new sphere as name { mass = m, position = [0, h, 0] }
+  set system.gravity = [0, -g0, 0]
+}
+Out[2]= function drop(3 parameter(s)) defined — 2 body line(s)
+In[3]:= drop("ball")
+In[4]:= get ball.position.y
+Out[4]= 10
+In[5]:= drop("pebble", 0.1, 2)
+In[6]:= get pebble.mass
+Out[6]= 0.1
+In[7]:= funcs
+Out[7]= drop(name, m = 1, h = 10) — 2 body line(s); SHOW drop prints it
+In[8]:= show drop
+Out[8]= def drop(name, m = 1, h = 10) {
+  new sphere as name { mass = m, position = [0, h, 0] }
+  set system.gravity = [0, -g0, 0]
+}
+In[9]:= def drop(name, m = 1, h = 100) { new sphere as name { mass = m, position = [0, h, 0] }; set system.gravity = [0, -g0, 0] }
+Out[9]= function drop(3 parameter(s)) defined — 2 body line(s) (redefined)
+In[10]:= drop("skydiver")
+In[11]:= skydiver.y
+Out[11]= 100
+In[12]:= speed
+Err[12]: unknown name `speed` (define it with LET, pass it as a function parameter, or use `speed.field` for a registered object)
+```
+
+*What to notice.* The function's `name` parameter holds a string, and
+`new sphere as name` inside the body names each created object from
+it — `ball`, `pebble`, `skydiver` — so one definition mints a family
+of named objects. `drop("ball")` used both defaults; cell 9 is the
+edit loop (copy cell 8's `SHOW` output, change `h`, re-`DEF` — note
+`;` separating body lines works as well as newlines); calls 3, 5 and
+10 print no `Out` because the last body line is a `SET`. Cell 12 is
+the bare-identifier error: execution-time resolution means the
+message can list every way to bind a name.
+
+Definition-time and call-time errors are specific: a reserved or
+builtin name is refused (`` DEF: `norm` is a builtin function and
+cannot be redefined ``), nested `DEF` is refused, an empty body is
+refused, a missing non-default argument fails as
+`name(): missing argument `p` (it has no default)`, too many
+arguments fail naming the signature, and the depth cap fails as
+`function call depth limit (32) exceeded`.
+
 ## 6. The notebook (cells, editing, magics)
 
 ### 6.1 Cells
@@ -677,11 +873,17 @@ Store obj0.mass   ← pops 14, calls set_mass(14)
 ```
 
 The machine's whole memory is a stack of typed values. Instructions:
-`Push v`, `Load path`, `Store path`, `Add Sub Mul Div Neg`,
+`Push v`, `Load path`, `Store path`, `LoadIdent name` (a bare
+identifier — parameter or `LET` variable, resolved at execution,
+§5.9), `StoreGlobal name` (`LET`), `Add Sub Mul Div Neg`,
 `PackList n` (build vector/quaternion/matrix literals), `Call f argc`
-(builtins), `NewObject shape` / `InitField f` / `FinishNew`, `Delete`,
-`ListObjects`, `Step`, `Run`, `SetMethod`, `Energy`, `CenterOfMass`,
-`TotalMomentum`, `TotalAngularMomentum`, `Laplace`, `Reset`, `Help`,
+(builtin or user function — a user call runs each body line through
+this same compile-and-execute pipeline inside a call frame),
+`NewObject shape` / `InitField f` / `FinishNew` (which also registers
+the `AS` name), `Delete`, `ListObjects`, `ListFns` / `ShowFn`
+(`FUNCS` / `SHOW`), `Step`, `Run`, `SetMethod`, `Energy`,
+`CenterOfMass`, `TotalMomentum`, `TotalAngularMomentum`, `Laplace`,
+`Reset`, `Help`,
 and `Scene(cmd)` for the §5.6 family (its numeric arguments — camera
 deltas, zoom factor, dt — travel on the same operand stack).
 `Load`/`Store` go **only** through the `physical_object` get/set API —
@@ -692,7 +894,7 @@ write. When the program ends, the value on top of the stack becomes
 
 ---
 
-## 9. Thirteen worked examples
+## 9. Fourteen worked examples
 
 All transcripts below are genuine program output (interactive sessions
 are shown as they appear when typed by hand).
@@ -1223,6 +1425,74 @@ disk (a measure-zero contact) — the ball-vs-anything collision tier is
 exact SDF geometry, not an approximation — while every finite-size
 body bounces off both. The walls end the run bit-identically at rest.
 
+### Example 14 — two dumbbells from a user-defined function
+
+The two-release finale: a user function (§5.9) that builds **named
+dumbbells** (§5.1), called twice to launch a pair of tumbling
+dumbbells at each other, off-center and spinning. No walls this time
+— so *all three* conserved quantities must survive the collisions.
+The script is `scripts/collisions/12_two_dumbbells.posim`; this
+transcript replays it.
+
+```
+In[1]:= set system.g_constant = 0
+In[2]:= def create_dumbell(name, m1 = 1, m2 = 1, m_rod = 0.5, r1 = 0.25, r2 = 0.25, rod_radius = 0.1, length = 1, position = [0, 0, 0], velocity = [0, 0, 0], angular_velocity = [0, 0, 0]) {
+  new dumbbell as name { m1 = m1, m2 = m2, m_rod = m_rod, r1 = r1, r2 = r2, rod_radius = rod_radius, length = length, position = position, velocity = velocity, angular_velocity = angular_velocity }
+}
+Out[2]= function create_dumbell(11 parameter(s)) defined — 1 body line(s)
+In[3]:= create_dumbell("dumbell0", 1, 2, 0.5, 0.25, 0.25, 0.1, 1, [-2, 0.15, 0], [1.5, 0, 0], [0, 0, 0.6])
+Out[3]= obj0 as dumbell0
+In[4]:= create_dumbell("dumbell1", 2, 1, 0.4, 0.3, 0.2, 0.08, 1.2, [2, -0.15, 0], [-1.5, 0, 0], [0.4, 0, 0])
+Out[4]= obj1 as dumbell1
+In[5]:= list
+Out[5]= obj0: dumbbell r1=0.25 r2=0.25 rod_r=0.1 len=1, mass=3.5, charge=0, pos=[-2, 0.15, 0]
+obj1: dumbbell r1=0.3 r2=0.2 rod_r=0.08 len=1.2, mass=3.4, charge=0, pos=[2, -0.15, 0]
+In[6]:= get dumbell0.m1
+Out[6]= 1
+In[7]:= get dumbell1.m_rod
+Out[7]= 0.3999999999999999
+In[8]:= get dumbell0.vx
+Out[8]= 1.5
+In[9]:= energy
+Out[9]= 7.865310611764706
+In[10]:= momentum
+Out[10]= [0.15000000000000036, 0, 0]
+In[11]:= angmom
+Out[11]= [0.4443030588235295, 0, -1.5059999999999998]
+In[12]:= run 3 steps 60
+Out[12]= t = 3 (3861 solver steps, 60 snapshots, |dE/E| = 9.463e-11, 2 collision(s) — CONTACTS lists them)
+In[13]:= energy
+Out[13]= 7.865310611020375
+In[14]:= momentum
+Out[14]= [0.15000000000000036, 0, 0]
+In[15]:= angmom
+Out[15]= [0.44430305882373156, -0.000000000000009547918011776346, -1.505999999999855]
+In[16]:= get system.collisions
+Out[16]= 2
+```
+
+*What to notice.* Cell 2 is one `DEF` whose single body line does
+everything: `new dumbbell as name { ... }` forwards all eleven
+parameters, and because `name` arrives as a string
+(`"dumbell0"`, `"dumbell1"`), each call registers the name it was
+given — `Out[3]`/`Out[4]` show both handles, `LIST` shows the part
+geometry, and cells 6–8 read the parts and the `.vx` shorthand
+through the names. (`Out[7]` reads 0.4 back as
+`0.3999999999999999`: the parts are stored as mass *fractions* of
+the total, so one reconstruction rounding step shows through —
+15 correct digits.) Then the physics: two tumbling, asymmetric rigid
+bodies meet off-center, collide **twice** (cell 16), and every
+conserved quantity survives the real CVODE event handling. Energy:
+`7.865310611764706 → 7.865310611020375` — the run banner prints
+`|dE/E| = 9.463e-11`. Momentum: `[0.15000000000000036, 0, 0]`
+**bit-identical**. Angular momentum about the origin — the delicate
+one, orbital `r×p` plus spin, exchanged between the two at every
+off-center impact: conserved to ~10⁻¹³ per component (`Out[11]` vs
+`Out[15]`), because the part-wise exact narrow phase applies the
+action–reaction impulse pair at one shared contact point. Contrast
+Example 13: there the infinitely massive walls absorbed momentum; here,
+with no walls, E, P *and* L all hold at solver precision.
+
 ---
 
 ## 10. Error message tour (so nothing surprises you)
@@ -1232,14 +1502,18 @@ body bounces off both. The walls end the run bit-identically at rest.
 | `get obj7.mass` (no obj7) | `no object obj7` |
 | `get obj0.bogus` | `unknown object field `bogus` — see HELP for the field list` |
 | `[1,0,0] * [0,1,0]` | `cannot multiply vec3 by vec3 (for vec3*vec3 use dot()/cross())` |
-| `set = 3` | `parse error at column 5: expected a path root (objN or system), found =` |
+| `set = 3` | ``parse error at column 5: expected a path root (`objN` or `system`), found `=` `` |
 | `run 1` under SPRK with a B field | `SPRK method requires a separable Hamiltonian: magnetic field B must be zero (the Lorentz force q v x B is velocity-dependent); use METHOD ADAMS or BDF` |
-| `bogusname` | `parse error …: unknown name bogusname (expected a number, [x,y,z], objN.field, system.field, or a function call)` |
+| `bogusname` | ``unknown name `bogusname` (define it with LET, pass it as a function parameter, or use `bogusname.field` for a registered object)`` |
+| `get d.m1` (only `ball` is registered) | ``no object named `d` (registered names: ["ball"]; NEW ... AS <name> creates one; positional paths are objN.field, contactK.field, system.field)`` |
+| `new sphere as d` (name taken) | ``the name `d` already refers to obj0 — DEL it or pick another name`` |
+| `new sphere as system` | `` `system` is reserved `` |
+| `show nosuch` | ``no user function `nosuch` — FUNCS lists the defined ones`` |
 | `scene status` before `SCENE CREATE` | `no scene window — run SCENE CREATE first` |
 | `scene create 99999` | `SCENE CREATE port must be an integer in 0..=65535` |
 | `scene reverse` right after `CREATE` | `scene: nothing to reverse — no forward history recorded yet (SCENE START first)` |
 | `scene set_time_step -1` | `scene: set_time_step needs a positive, finite dt` |
-| `scene fly` | `parse error at column 7: unknown SCENE sub-command … (expected CREATE, CLOSE, TRANSLATE, ROTATE, ZOOM, HIDE, SHOW, REFRESH, REDRAW, START, STOP, PAUSE, REVERSE, SET_TIME_STEP, STATUS or EVENTS)` |
+| `scene fly` | `parse error at column 7: unknown SCENE sub-command … (expected CREATE, CLOSE, TRANSLATE, ROTATE, ZOOM, HIDE, SHOW, REFRESH, REDRAW, START, STOP, PAUSE, REVERSE, RESET, SET_TIME_STEP, STATUS or EVENTS)` |
 
 Every error names the column or the exact field/feature at fault, and
 never aborts the session.

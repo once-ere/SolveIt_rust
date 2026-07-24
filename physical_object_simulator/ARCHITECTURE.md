@@ -53,7 +53,7 @@ research survey, the protocol, and the UI), [CLAUDE.md](CLAUDE.md)
 | module | owns | must NOT do |
 |---|---|---|
 | `linalg` | `Vec3`, `Mat3`, `Quat`: all vector/matrix/quaternion math. `Copy + Clone + Debug + PartialEq`. Zero-guards: `Vec3::normalize`(0)→0, `Quat::normalize`(degenerate)→identity, `Mat3::try_inverse`→`Option` | depend on any other module |
-| `boundary` | `Boundary` enum (`Point`, `Sphere`, `Cuboid`, `Torus`, `Disk`, `Cylinder`), `Sdf` trait (`signed_distance` + default central-difference `surface_normal`, ε = 1e-6, ported verbatim; the torus/disk/cylinder SDFs are exact closed forms — the ideal zero-thickness disk's is the *unsigned* distance, zero exactly on the disk), `analytic_inertia_tensor` (Point → zero matrix; torus Iz = m(c²+¾a²), Ixy = m(½c²+⅝a²); disk Ixy = ¼ma², Iz = ½ma²; cylinder Iz = ½mr², Ixy = m(3r²+4h²)/12), the support family `support_extent`/`support_point`/`support_rank`/`bounding_radius` (conventions in §3.8) | hold `dyn` trait objects (keeps the object `Clone`) |
+| `boundary` | `Boundary` enum (`Point`, `Sphere`, `Cuboid`, `Torus`, `Disk`, `Cylinder`, `Dumbbell` — §3.8), `Sdf` trait (`signed_distance` + default central-difference `surface_normal`, ε = 1e-6, ported verbatim; the torus/disk/cylinder SDFs are exact closed forms — the ideal zero-thickness disk's is the *unsigned* distance, zero exactly on the disk), `analytic_inertia_tensor` (Point → zero matrix; torus Iz = m(c²+¾a²), Ixy = m(½c²+⅝a²); disk Ixy = ¼ma², Iz = ½ma²; cylinder Iz = ½mr², Ixy = m(3r²+4h²)/12), the support family `support_extent`/`support_point`/`support_rank`/`bounding_radius` (conventions in §3.8) | hold `dyn` trait objects (keeps the object `Clone`) |
 | `physical_object` | the union struct; **all invariant enforcement lives in its setters** (see §3.1); observables; three constructors | integrate time (delegates to `integrate`) |
 | `system` | `PhysicalObjectSystem`; observables over the collection; `add_object`/`remove_object` (keeps `external_forces`/`external_torques` index-aligned); `pack_state`/`unpack_state` | touch solvers |
 | `integrate` | **the only module that advances time** — CVODE and ARKODE drivers, RHS functions, `Method`, `RunReport`/`Snapshot`, `propagate_single` | be bypassed: no other module may implement stepping |
@@ -156,6 +156,45 @@ literals, the JSON protocol, the scene frame messages, the docs).
   (`scene rotate 15 -5` is two arguments; a sum must be parenthesized).
   This is deliberate: space-separated argument lists and infix `-` are
   otherwise ambiguous. Keep `scene_command()` on `term()`.
+- **`DEF` is a line form handled ahead of the grammar**
+  (`DEF name(param [= default], ...) { body }`; multi-line bodies —
+  the notebook shows `...:=` continuation prompts, scripts join lines
+  by brace depth). The body is newline/`;`-separated ordinary commands
+  using the parameters as variables; **every body line is
+  syntax-checked at definition time**; defaults are ordinary
+  expressions evaluated **once at definition** (`LET` variables
+  visible). The source is preserved verbatim: redefinition replaces,
+  and `SHOW name` prints the verbatim source — that is the edit loop;
+  `FUNCS` lists signatures.
+- **Calls run on an env stack** (`SimState.env_stack`): ordinary call
+  syntax with trailing defaults; each call pushes a frame
+  (`MAX_CALL_DEPTH = 32`), the body returns the last line's value, and
+  a failing line **rolls the whole call back**, naming the function
+  and the offending line in the error.
+- **The name registry** (`SimState.names`): `NEW <shape> AS <name>`
+  registers a user name — a string literal, or a bare identifier that
+  resolves first against a parameter/`LET` string binding (so a
+  function names the objects it creates from its arguments). Named
+  paths work everywhere paths do (`ball.mass`, `dumbell0.position.x`);
+  `DEL`/`BOX` renumber the registry; duplicate and reserved names
+  (`objN`/`contactK`/`system`) are refused. Every object gains the
+  component shorthands `.x .y .z .vx .vy .vz`. String literals
+  (`"..."`) join the value system; `LET name = expr` stores session
+  variables. Machine-mode objects carry their registered `"name"`.
+- **Bare identifiers compile** (`Instr::LoadIdent`) and resolve at
+  execution; a mistyped root's runtime error still teaches
+  `objN`/`contactK`/`system`.
+- **Deferred + validated-once constructors**: torus geometry
+  (`pending_torus`, §3.8) and the dumbbell (`NEW DUMBBELL AS d
+  { m1, m2, m_rod, r1, r2, rod_radius, length, ... }`,
+  `pending_dumbbell`) collect their parameters order-independently
+  and are resolved + validated **once** at `FinishNew` (the dumbbell
+  via `boundary::dumbbell`).
+  `d.m1/.m2/.m_rod/.r1/.r2/.rod_radius/.length` read AND write — the
+  mass fractions stored in the boundary keep every part recoverable,
+  and a member write rebuilds total mass, COM offsets and the inertia
+  tensor in one step. New keywords: `as`, `let`, `funcs`|`functions`,
+  `dumbbell`|`dumbell` (aliases).
 
 ### 3.5 Wire protocol (machine.rs ↔ jupyter/)
 
@@ -205,6 +244,17 @@ crate root (module/type namespace collision) — do not try.
   and `RESET`). Notebook `STEP`/`RUN` do **not** move the window;
   window playback does **not** move the notebook. This isolation is
   what lets both sides stay responsive without locking the VM.
+- **`Shared.initial` / `reset_playback`**: `Shared` keeps an
+  `initial` snapshot of the playback system — the state last synced
+  at `SCENE CREATE` or `SCENE REFRESH`. Reset is reachable **three
+  ways sharing one primitive** (`Shared::reset_playback`): the
+  permanent toolbar **Reset** button (`bt-reset`), the window `reset`
+  command, and the `SCENE RESET` notebook command. The primitive
+  restores the snapshot **bit-identically** — every mutable value and
+  the time return to their initial values — clears history and the
+  step counter, and returns the mode to `Stopped`; the Start button
+  then re-starts the simulation from the beginning
+  (`reset_restores_the_initial_state_and_start_reruns`).
 - **Forward evolution goes through `integrate::step` only** (rule 1
   applies inside the scene too). **Reverse is snapshot replay**: each
   forward tick pushes a `Clone` of the system into a ring buffer
@@ -222,16 +272,29 @@ crate root (module/type namespace collision) — do not try.
 - **Message protocol** (JSON text frames):
   server→window `init` (entity geometry — each entity carries its
   shape plus that shape's parameters (`radius`, `half_extents`,
-  `ring_radius`/`tube_radius`, `half_height`) and `"wall":true` on
-  `BOX` slabs; a top-level `"box":<size>` appears when a box exists —
-  plus camera + playback state, sent on connect / REFRESH / REDRAW /
-  structural change),
-  `frame` (t, dt, mode, steps, history, energy, hidden, per-body
+  `ring_radius`/`tube_radius`, `half_height`, and for dumbbells
+  `r1`/`r2`/`rod_radius`/`z1`/`z2`), its registered user `"name"`
+  when one exists, and `"wall":true` on `BOX` slabs; a top-level
+  `"box":<size>` appears when a box exists — plus camera + playback
+  state, sent on connect / REFRESH / REDRAW / structural change),
+  `frame` (t, dt, mode, steps, history, energy, `p` = total momentum
+  and `l` = total angular momentum about the origin — computed on the
+  playback copy every tick — hidden, per-body
   `[x,y,z,qw,qx,qy,qz]` — w-first, §3.2), `camera`;
   window→server `cmd` (`start/pause/stop/reverse/step/step_back/
   set_dt/refresh`), `camera` (gesture sync, throttled to 10 Hz),
   `request_state`, `event` (level + message). Unknown types become
   error events, never panics.
+- **Conserved-quantity readout + name labels** (`scene.html`): the
+  window shows a permanent labeled readout (`hud`) — E, P and L lines
+  with components and magnitudes — updated live from each frame's
+  `energy`/`p`/`l`. Entity labels prefer the registered user name
+  (`dumbell0`) over `objN`; dumbbells draw as one rigid body — two
+  shaded spheres at their rotated COM offsets joined by the rod's
+  four silhouette lines, so spin is visible.
+  `SceneHandle::set_box(box_size, walls, names)` also ships the
+  user-name registry (the `SCENE CREATE`/`SCENE REFRESH`/`RESET`
+  call sites keep it current).
 - **Camera**: z-up orbit — `yaw`/`pitch` in degrees (pitch clamped to
   ±89°), `dist > 0`, `target` in world units. The browser owns gesture
   handling (arrows translate along the view basis, left-drag orbits,
@@ -258,7 +321,8 @@ crate root (module/type namespace collision) — do not try.
   collide.rs, integrate.rs, the VM paths, machine JSON and the scene
   protocol — change them nowhere or everywhere.
 - **Narrow phase is closed-form** (no GJK/EPA/MPR — the shape set
-  {Point, Sphere, Cuboid, Torus, Disk, Cylinder} is closed), in
+  {Point, Sphere, Cuboid, Torus, Disk, Cylinder, Dumbbell} is closed;
+  the dumbbell decomposes over its parts, below), in
   **three exactness tiers**:
   (1) *exact ball-vs-anything*: sphere-sphere by center distance,
   sphere-cuboid by box SDF (interior branch → nearest face), and
@@ -312,6 +376,40 @@ crate root (module/type namespace collision) — do not try.
   comparable): a small cap landing on a big wall face contacts at the
   CAP center, carrying no spurious lever arm
   (`small_cap_on_large_face_contacts_at_the_cap_center`).
+- **Dumbbell** (`Boundary::Dumbbell { r1, r2, rod_radius, z1, z2, f1,
+  f2 }`): two solid spheres plus a solid rod as **ONE rigid body** —
+  sphere 1 at `(0,0,z1)`, sphere 2 at `(0,0,z2)`, the rod between
+  them, with the part mass fractions `f1`/`f2` stored so every part
+  stays recoverable. The constructor
+  `boundary::dumbbell(m1, m2, m_rod, r1, r2, rod_radius, length)`
+  places `z1 = −(m2 + m_rod/2)·L/M`, `z2 = (m1 + m_rod/2)·L/M`, so
+  the body-frame origin **IS** the center of mass (identity
+  `m1·z1 + m2·z2 + m_rod·(z1 + z2)/2 = 0`, pinned by
+  `dumbbell_constructor_com_sdf_and_supports`). The union SDF is
+  exact (min of the parts); the composite inertia is exact
+  (2/5·m·r² spheres + parallel-axis + rod cylinder terms). It is the
+  first **non-centrally-symmetric** shape: `support_extent` is now
+  the true **directed** `h(u) = max x·u` (bit-identical formulas for
+  all symmetric shapes), the support-axis tier evaluates the general
+  directed SAT gap `d·l − h_a(l) − h_b(−l)` for **both** axis
+  orientations — **it reduces exactly to `|d·l| − e_a − e_b` for
+  symmetric shapes** — and `world_aabb` takes the directed ± extents.
+- **Dumbbell narrow phase DECOMPOSES over the parts**:
+  dumbbell-vs-anything splits into its two spheres and its rod — each
+  sphere part uses the other shape's **exact SDF** at its center
+  (exact against every shape, including another dumbbell's union
+  SDF), and the rod recurses as a free-standing cylinder — so only
+  rod-vs-rod ever reaches the approximate support-axis tier; contact
+  selection takes the deepest part
+  (`dumbbell_wall_gaps_and_ball_contacts_are_exact`: asymmetric wall
+  gaps exact for both ends — the light end pokes farther,
+  `|z1| > |z2|` when `m2 > m1` — ball-vs-pole and ball-vs-rod exact).
+  This exactness is what makes the anchor pass: two tumbling
+  dumbbells colliding off-center conserve E, P **and L (about the
+  origin)** to 1e-8 through the real CVODE event path
+  (`colliding_dumbbells_conserve_energy_momentum_and_angular_momentum`)
+  — the impulse pair acts at one shared contact point, so the net
+  torque is zero.
 - **Arming condition**: `collide_enabled && !collidable_pairs.is_empty()`
   — pairs exclude Point-Point and static-static. **Step-selection
   invariance**: CVODE's root check runs after each completed internal
@@ -402,7 +500,8 @@ crate root (module/type namespace collision) — do not try.
   infinite mass — walls contribute 0 to every denominator and receive
   no state writes (they stay bit-identically at rest), with zero
   special-casing in the library. The scene learns of the box via
-  `SceneHandle::set_box(box_size, walls)` and draws a dashed interior
+  `SceneHandle::set_box(box_size, walls, names)` (the third argument
+  is the user-name registry — §3.7) and draws a dashed interior
   wireframe instead of the six slabs (§3.7 `init`: per-entity
   `"wall":true`, top-level `"box":<size>`); `RESET` with an open
   window pushes `set_box` too, clearing the window's box wireframe
@@ -411,9 +510,10 @@ crate root (module/type namespace collision) — do not try.
   or a failing final validation removes the just-appended object — no
   half-built ghosts (the object was appended last, so removal
   renumbers nothing else). Torus geometry in `NEW` is **deferred**
-  (`SimState.pending_torus`) and resolved + validated once at
-  `FinishNew`: ring/tube apply first, inner/outer override the
-  derived pair — so `inner_radius`/`outer_radius` are genuinely
+  (`SimState.pending_torus`; the dumbbell's seven parameters likewise
+  in `SimState.pending_dumbbell` — §3.4) and resolved + validated
+  once at `FinishNew`: ring/tube apply first, inner/outer override
+  the derived pair — so `inner_radius`/`outer_radius` are genuinely
   order-independent (including pairs like
   `{ outer_radius = 0.5, inner_radius = 0.2 }` that sequential
   validation used to reject in one order). `inner_radius = 0` (horn
@@ -451,17 +551,17 @@ queues an event.
 
 | layer | where | what it proves |
 |---|---|---|
-| linalg/boundary/struct/system units | `physical_object/src/*` `#[cfg(test)]` | math identities, setter invariants, donor-formula equivalence, pack/unpack round-trip; torus/disk/cylinder SDF values and inertia tensors, support extent/point exactness (`p·u = h(u)`, `torus_disk_cylinder_sdfs`, `support_extents_and_points_are_exact`) |
+| linalg/boundary/struct/system units | `physical_object/src/*` `#[cfg(test)]` | math identities, setter invariants, donor-formula equivalence, pack/unpack round-trip; torus/disk/cylinder SDF values and inertia tensors, support extent/point exactness (`p·u = h(u)`, `torus_disk_cylinder_sdfs`, `support_extents_and_points_are_exact`); the dumbbell constructor, COM identity, union SDF, directed supports and composite inertia (`dumbbell_constructor_com_sdf_and_supports`) |
 | solver integration | `physical_object/tests/conservation.rs` | analytic solutions (parabola, constant torque, gyration period), conservation, SPRK gate, empty-system edges |
 | self-checking examples | `physical_object/examples/*` | long-horizon physics: donor solar-system cross-check, Kepler LRL, Dzhanibekov, gyroradius |
-| language units | `posim/src/*` `#[cfg(test)]` | token streams (incl. scene keywords), postfix programs (incl. `scenecmd`), VM sessions, notebook magics, JSON round-trip; the shape/BOX surfaces end-to-end: `new_shapes_and_parameter_paths`, `box_family_and_infinite_mass_walls`, `torus_pair_is_order_independent_and_new_is_transactional` (transactional NEW + deferred torus), `box_recreate_after_wall_deletion_leaks_nothing` (vm), `state_reports_box_walls_and_inverse_mass` (machine) |
+| language units | `posim/src/*` `#[cfg(test)]` | token streams (incl. scene keywords), postfix programs (incl. `scenecmd`), VM sessions, notebook magics, JSON round-trip; the shape/BOX surfaces end-to-end: `new_shapes_and_parameter_paths`, `box_family_and_infinite_mass_walls`, `torus_pair_is_order_independent_and_new_is_transactional` (transactional NEW + deferred torus), `box_recreate_after_wall_deletion_leaks_nothing` (vm), `state_reports_box_walls_and_inverse_mass` (machine); the function/name surface: `def_call_named_objects_and_dumbbell_members` (define/call/members/shorthands/renumber/errors/redefine/LET-defaults/ghost-free failing calls), and the parser pins that bare identifiers compile to `LoadIdent` while a mistyped root's runtime error still teaches `objN`/`contactK`/`system` |
 | websocket primitives | `posim/src/scene/ws.rs` `#[cfg(test)]` | SHA-1 FIPS 180-4 vectors, base64 RFC 4648 vectors, the RFC 6455 §1.3 accept-key example |
-| scene server integration | `posim/src/scene/mod.rs` `#[cfg(test)]` | HTTP page serving (toolbar/statusbar/gesture wiring present), full WS session (handshake, init, camera sync, cmd start/pause, event path, frame broadcasts), forward-then-reverse playback landing exactly on t = 0, `box_shapes_and_wall_flags_reach_the_init_message` |
-| collision geometry/impulse units | `physical_object/src/collide.rs` `#[cfg(test)]` | known separations/depths/normals, SAT face vs. edge, separation continuity, n·Kn closed form, static-wall reflection (wall bit-unchanged), separating pairs untouched, projection; `ball_vs_torus_exact_contact_and_hole_passage`, `ball_vs_disk_and_cylinder_contacts`, `tilted_torus_fits_a_4x4_box_where_flat_does_not`, `static_slab_reflects_a_cylinder_elastically`, `parallel_cylinders_side_contact_is_exact` (radial rejection axes), `parallel_disk_disk_separation_is_the_documented_limitation` (the pinned face-on disk-disk limitation), `small_cap_on_large_face_contacts_at_the_cap_center` (equal-rank footprint rule) |
-| collision event integration | `physical_object/tests/collision.rs` | real CVODE/ARKODE events vs. closed forms: exchange + TOI < 1e-9, restitution ratios/e², cradle, ΔL = r×J, apex e²h, thin-wall no-tunnel, bit-identical zero-pair invariance, armed-but-quiet ≤ 1e-12, SPRK path + gate; `ball_in_a_rigid_box_conserves_energy_and_walls_never_move`, `point_threads_the_torus_hole_but_a_fat_ball_bounces` (TOI = (3−√1.45)/4), `mixed_shapes_rattle_in_the_box_conserving_energy` (|ΔE|/E < 1e-6), `ball_released_from_rest_does_not_tunnel_the_thin_plate` (acceleration-aware cap, from-rest TOI to 1e-6) |
+| scene server integration | `posim/src/scene/mod.rs` `#[cfg(test)]` | HTTP page serving (toolbar/statusbar/gesture wiring present, incl. `bt-reset`), full WS session (handshake, init, camera sync, cmd start/pause, event path, frame broadcasts), forward-then-reverse playback landing exactly on t = 0, `box_shapes_and_wall_flags_reach_the_init_message`; `reset_restores_the_initial_state_and_start_reruns` (bit-identical restore of the initial state + restart), and the protocol tests assert `p`/`l` in every frame and the `name` in init |
+| collision geometry/impulse units | `physical_object/src/collide.rs` `#[cfg(test)]` | known separations/depths/normals, SAT face vs. edge, separation continuity, n·Kn closed form, static-wall reflection (wall bit-unchanged), separating pairs untouched, projection; `ball_vs_torus_exact_contact_and_hole_passage`, `ball_vs_disk_and_cylinder_contacts`, `tilted_torus_fits_a_4x4_box_where_flat_does_not`, `static_slab_reflects_a_cylinder_elastically`, `parallel_cylinders_side_contact_is_exact` (radial rejection axes), `parallel_disk_disk_separation_is_the_documented_limitation` (the pinned face-on disk-disk limitation), `small_cap_on_large_face_contacts_at_the_cap_center` (equal-rank footprint rule), `dumbbell_wall_gaps_and_ball_contacts_are_exact` (asymmetric wall gaps exact for both ends, ball-vs-pole and ball-vs-rod contacts exact) |
+| collision event integration | `physical_object/tests/collision.rs` | real CVODE/ARKODE events vs. closed forms: exchange + TOI < 1e-9, restitution ratios/e², cradle, ΔL = r×J, apex e²h, thin-wall no-tunnel, bit-identical zero-pair invariance, armed-but-quiet ≤ 1e-12, SPRK path + gate; `ball_in_a_rigid_box_conserves_energy_and_walls_never_move`, `point_threads_the_torus_hole_but_a_fat_ball_bounces` (TOI = (3−√1.45)/4), `mixed_shapes_rattle_in_the_box_conserving_energy` (|ΔE|/E < 1e-6), `ball_released_from_rest_does_not_tunnel_the_thin_plate` (acceleration-aware cap, from-rest TOI to 1e-6), `colliding_dumbbells_conserve_energy_momentum_and_angular_momentum` (two tumbling dumbbells off-center: E, P and L about the origin to 1e-8 through real CVODE events) |
 | wire/kernel | `jupyter/test_protocol.py`, `jupyter/test_kernel.py` | machine protocol incl. the scene command family and the `events` op; full Jupyter ZMQ path |
 | real-browser gestures | scratchpad `verify_gestures.py` (headless Chrome CDP; not committed) | genuine key/mouse/wheel input: arrows translate right/left/up/down, left-drag rotates, wheel and +/- zoom, toolbar Start/Pause/Reverse, statusbar reporting |
 
-Regression invariant: `cargo test --workspace` green (94 tests:
-37 lib + 15 collision + 9 conservation + 33 posim) and
+Regression invariant: `cargo test --workspace` green (99 tests:
+39 lib + 16 collision + 9 conservation + 35 posim) and
 `cargo build --workspace` warning-free at every commit.

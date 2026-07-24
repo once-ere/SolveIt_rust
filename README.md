@@ -29,11 +29,17 @@ integration runs through the pure-Rust SUNDIALS 7.7.0 translation
 (CVODE Adams/BDF, ARKODE symplectic SPRK). Zero `unsafe`, zero external
 crate dependencies, zero warnings.
 
-Latest release: six boundary shapes (`POINT`, `SPHERE`, `CUBOID`,
-`TORUS`, `DISK`, `CYLINDER`) with exact SDF-based collision detection,
-plus the `BOX` command — a rigid, infinitely massive bounding container
-realized as six static walls; 94 tests green (37 lib + 15 collision +
-9 conservation + 33 posim).
+Latest release: a programmable notebook and a compound rigid body —
+user-defined functions (`DEF name(param = default, ...) { body }`,
+every body line syntax-checked at definition, `FUNCS`/`SHOW` to list
+and edit), named objects (`NEW ... AS name`, plus `LET` variables and
+string literals), and the rigid `DUMBBELL` (two solid spheres plus a
+rod as ONE rigid body, exact part-wise collisions conserving E, P and
+L through real solver events); the scene window gains a permanent
+Reset button (with `SCENE RESET` — bit-identical re-initialization,
+Start re-runs) and a live labeled conserved-quantities readout (E, P
+and L); 99 tests green (39 lib + 16 collision + 9 conservation +
+35 posim).
 
 - `physical_object/` — library: `pub struct physical_object`, the
   unique union of the legacy `PointParticle`, `RigidBody` and
@@ -51,11 +57,11 @@ realized as six static walls; 94 tests green (37 lib + 15 collision +
 
 - [grammar.md](physical_object_simulator/grammar.md) /
   [grammar.pdf](physical_object_simulator/grammar.pdf) — the complete
-  command-language and notebook specification, with thirteen worked
+  command-language and notebook specification, with fourteen worked
   examples.
 - [physical_object_simulator.md](physical_object_simulator/physical_object_simulator.md) /
   [physical_object_simulator.pdf](physical_object_simulator/physical_object_simulator.pdf) — the
-  full solution guide for new users, with thirteen more worked examples.
+  full solution guide for new users, with fourteen more worked examples.
 - [ARCHITECTURE.md](physical_object_simulator/ARCHITECTURE.md) — module
   responsibilities and pinned cross-module contracts.
 - [CLAUDE.md](physical_object_simulator/CLAUDE.md) — working rules for
