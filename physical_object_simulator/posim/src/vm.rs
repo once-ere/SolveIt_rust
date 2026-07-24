@@ -1,0 +1,1888 @@
+//! The stack machine: executes the postfix instruction programs emitted
+//! by [`crate::parser`] against a [`SimState`] holding the
+//! [`PhysicalObjectSystem`]. All field access goes through the
+//! `physical_object` get/set API — the VM never pokes raw state.
+
+use std::fmt;
+
+use ::physical_object::boundary::Boundary;
+use ::physical_object::integrate::{run as sundials_run, step as sundials_step, Method};
+use ::physical_object::linalg::{Mat3, Quat, Vec3};
+use ::physical_object::physical_object::physical_object;
+use ::physical_object::PhysicalObjectSystem;
+
+/// Runtime values on the operand stack.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Num(f64),
+    Vec3(Vec3),
+    Quat(Quat),
+    Mat3(Mat3),
+    List(Vec<Value>),
+    Str(String),
+    Unit,
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Num(n) => write!(f, "{n}"),
+            Value::Vec3(v) => write!(f, "[{}, {}, {}]", v.x, v.y, v.z),
+            Value::Quat(q) => write!(f, "quat[w={}, x={}, y={}, z={}]", q.w, q.x, q.y, q.z),
+            Value::Mat3(m) => write!(
+                f,
+                "[[{}, {}, {}], [{}, {}, {}], [{}, {}, {}]]",
+                m.0[0][0], m.0[0][1], m.0[0][2],
+                m.0[1][0], m.0[1][1], m.0[1][2],
+                m.0[2][0], m.0[2][1], m.0[2][2]
+            ),
+            Value::List(items) => {
+                write!(f, "[")?;
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{it}")?;
+                }
+                write!(f, "]")
+            }
+            Value::Str(s) => write!(f, "{s}"),
+            Value::Unit => Ok(()),
+        }
+    }
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Num(_) => "number",
+        Value::Vec3(_) => "vec3",
+        Value::Quat(_) => "quaternion",
+        Value::Mat3(_) => "mat3",
+        Value::List(_) => "list",
+        Value::Str(_) => "string",
+        Value::Unit => "unit",
+    }
+}
+
+/// Root of a dotted path.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PathRoot {
+    Object(usize),
+    System,
+    /// A recorded contact of the last STEP/RUN (read-only).
+    Contact(usize),
+}
+
+/// A dotted access path: `obj0.position.x`, `system.g_constant`,
+/// `contact0.normal`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Path {
+    pub root: PathRoot,
+    pub field: String,
+    /// Component index: 0=x, 1=y, 2=z, 3=w.
+    pub comp: Option<usize>,
+}
+
+impl fmt::Display for Path {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.root {
+            PathRoot::Object(i) => write!(f, "obj{i}.{}", self.field)?,
+            PathRoot::System => write!(f, "system.{}", self.field)?,
+            PathRoot::Contact(k) => write!(f, "contact{k}.{}", self.field)?,
+        }
+        if let Some(c) = self.comp {
+            write!(f, ".{}", ["x", "y", "z", "w"][c.min(3)])?;
+        }
+        Ok(())
+    }
+}
+
+/// Shapes creatable via `NEW`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShapeKind {
+    Point,
+    Sphere,
+    Cuboid,
+    Torus,
+    Disk,
+    Cylinder,
+}
+
+/// Parsed `BOX` command mode (`Create` pops the inner side length).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BoxMode {
+    Status,
+    Off,
+    Create,
+}
+
+/// Parsed `METHOD` argument.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MethodSpec {
+    Adams,
+    Bdf,
+    Sprk { table: String, dt: f64 },
+}
+
+/// Parsed `SCENE` sub-command. Numeric arguments (translate deltas,
+/// rotation angles, zoom factor, dt) arrive on the operand stack.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SceneCmd {
+    /// Open the scene window server (port 0 = OS-assigned).
+    Create { port: u16 },
+    /// Shut the scene window server down.
+    Close,
+    /// Pop dz, dy, dx: move the camera target.
+    Translate,
+    /// Pop dpitch, dyaw (degrees): orbit the camera.
+    Rotate,
+    /// Pop a factor: > 1 zooms in, < 1 zooms out.
+    Zoom,
+    ZoomIn,
+    ZoomOut,
+    /// `None` = all objects.
+    Hide(Option<usize>),
+    Show(Option<usize>),
+    /// Re-sync the scene copy from the notebook system.
+    Refresh,
+    /// Re-send the full scene description to every window.
+    Redraw,
+    /// Playback control of the time-stepped evolution.
+    Start,
+    Stop,
+    Pause,
+    Reverse,
+    /// Pop dt: set the playback time step.
+    SetTimeStep,
+    Status,
+    /// Drain asynchronous window -> notebook events.
+    Events,
+}
+
+/// Stack-machine instructions (the compiled program is pure postfix).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Instr {
+    Push(Value),
+    Load(Path),
+    Store(Path),
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Neg,
+    /// Pop `n` values, pack: 3 numbers → vec3, 4 numbers → quaternion,
+    /// 3 vec3 → mat3 (rows), anything else → list.
+    PackList(usize),
+    /// Pop `argc` arguments, call a builtin, push the result.
+    Call(String, usize),
+    NewObject(ShapeKind),
+    /// Pop a value, apply it as a `NEW { field = ... }` initializer.
+    InitField(String),
+    FinishNew {
+        recompute_inertia: bool,
+    },
+    Delete(usize),
+    ListObjects,
+    /// Pop dt, advance the system by dt via sundials.
+    Step,
+    /// Pop a duration, advance via sundials with `outputs` snapshots.
+    Run {
+        outputs: usize,
+    },
+    SetMethod(MethodSpec),
+    Energy,
+    CenterOfMass,
+    TotalMomentum,
+    TotalAngularMomentum,
+    Laplace(usize),
+    Reset,
+    Help,
+    /// Graphical scene window command (see [`SceneCmd`]).
+    Scene(SceneCmd),
+    /// `COLLIDE [ON|OFF]` — `None` reports the current status.
+    Collide(Option<bool>),
+    /// `CONTACTS` — list the contacts of the last STEP/RUN.
+    Contacts,
+    /// `BOX [OFF | <size>]` — the rigid, infinitely massive bounding
+    /// box (six static wall slabs with inverse mass 0).
+    Box(BoxMode),
+}
+
+/// The mutable simulator state driven by the notebook / machine modes.
+pub struct SimState {
+    pub system: PhysicalObjectSystem,
+    /// The scene window server, when `SCENE CREATE` has run.
+    pub scene: Option<crate::scene::SceneHandle>,
+    /// True under `--machine`: scene events are also pushed as
+    /// unsolicited JSON lines for the Jupyter kernel.
+    pub machine_mode: bool,
+    /// Inner side length of the rigid bounding box, when `BOX <size>`
+    /// created one (`None` = no box). The box is realized as six static
+    /// wall-slab objects whose indices are tracked in `wall_indices`.
+    pub box_size: Option<f64>,
+    /// Object indices of the six wall slabs (kept in sync by DEL).
+    pub wall_indices: Vec<usize>,
+    last_new: Option<usize>,
+    pending_velocity: Option<Vec3>,
+    pending_angular_velocity: Option<Vec3>,
+    /// Deferred torus geometry from a `NEW TORUS { ... }` initializer
+    /// list: `[ring, tube, inner, outer]`, resolved and validated ONCE
+    /// in `FinishNew` so the inner/outer pair is order-independent.
+    pending_torus: Option<[Option<f64>; 4]>,
+}
+
+impl Default for SimState {
+    fn default() -> Self {
+        Self {
+            system: PhysicalObjectSystem::new(Vec::new(), 1.0),
+            scene: None,
+            machine_mode: false,
+            box_size: None,
+            wall_indices: Vec::new(),
+            last_new: None,
+            pending_velocity: None,
+            pending_angular_velocity: None,
+            pending_torus: None,
+        }
+    }
+}
+
+pub const HELP_TEXT: &str = "\
+posim command language (case-insensitive keywords):
+  NEW POINT|SPHERE|CUBOID|TORUS|DISK|CYLINDER { field = expr, ... }
+                            create an object (-> objN)
+      fields: mass, charge, position, velocity, momentum, orientation,
+              angular_velocity, angular_momentum, radius, half_extents,
+              ring_radius, tube_radius (torus; or inner_radius +
+              outer_radius), height (cylinder), inertia_tensor,
+              magnetic_moment_tensor, force, torque, restitution
+  BOX <size> | BOX OFF | BOX
+                            rigid, infinitely massive bounding box:
+                            six static wall slabs (inverse_mass = 0 —
+                            the equations of motion only ever use the
+                            INVERSE mass, so infinite mass is exactly
+                            representable); objects collide elastically
+                            off the inside faces; bare BOX = status;
+                            GET system.box reads the size (0 = none)
+  SET <path> = <expr>       write a field   (e.g. SET obj0.mass = 2)
+  GET <path>                read a field    (e.g. GET obj0.position.x)
+      paths: objN.<field>[.x|y|z|w], system.<field>, contactK.<field>
+      system fields: g_constant, softening, uniform_gravity, e_field,
+                     b_field, rtol, atol, time, method, collide,
+                     contacts, collisions, restitution_threshold,
+                     contact_slop, box
+  DEL <n>                   delete object n (later objects renumber)
+  LIST                      list all objects
+  STEP <dt>                 advance time by dt (sundials solver)
+  RUN <t> [STEPS <n>]       advance by t with n output snapshots
+  METHOD ADAMS | BDF | SPRK <table> [dt]
+                            choose the sundials integrator
+  ENERGY | COM | MOMENTUM | ANGMOM | LAPLACE <n>
+                            system observables
+  <expr>                    evaluate: numbers, [x,y,z], paths, + - * /,
+                            dot() cross() norm() normalize() sqrt() abs()
+                            sin() cos() exp() log(), pi, tau
+  RESET                     clear the system
+  HELP                      this text
+rigid-body collisions (event-detected at the exact time of impact):
+  COLLIDE [ON|OFF]          enable/disable (default ON; bare = status)
+  CONTACTS                  list contacts of the last STEP/RUN:
+                            pair, time, point, normal (i->j, the
+                            action-reaction line), depth, impulse
+  GET contactK.<field>      read one contact: i, j, t, point, normal,
+                            depth, rel_vel_n, impulse (read-only)
+  SET objN.restitution = e  bounciness 0..1 (default 1 = elastic;
+                            a pair uses min(e_i, e_j))
+  SET system.restitution_threshold | system.contact_slop
+                            resting-contact and overlap tolerances
+graphical scene window (opens in your web browser):
+  SCENE CREATE [port]       open the scene window (all entities shown)
+  SCENE CLOSE               close it (alias: SCENE DESTROY)
+  SCENE TRANSLATE dx dy [dz]  move the view; SCENE ROTATE dyaw dpitch
+  SCENE ZOOM IN | OUT | <f> zoom the view (f > 1 zooms in)
+  SCENE HIDE [n|ALL] / SCENE SHOW [n|ALL]   hide / show entities
+  SCENE REFRESH             re-sync the window from the notebook state
+  SCENE REDRAW              force a full redraw of every window
+  SCENE START | STOP | PAUSE | REVERSE
+                            control the time-stepped evolution
+                            (REVERSE replays recorded history backward)
+  SCENE SET_TIME_STEP dt    set the playback time step
+  SCENE STATUS              connection / camera / playback report
+  SCENE EVENTS              read async events sent by the window
+  in the window: arrow keys translate, left-drag rotates,
+                 wheel or +/- zooms, H shows all controls
+notebook magics: %history  %edit <n> <text>  %rerun <n>  %save <file>
+                 %load <file>  %reset  %quit";
+
+/// Executes a compiled program; returns the resulting top-of-stack
+/// value (or `Unit` for pure side-effect commands).
+pub fn execute(prog: &[Instr], state: &mut SimState) -> Result<Value, String> {
+    let mut stack: Vec<Value> = Vec::new();
+    for instr in prog {
+        if let Err(e) = exec_one(instr, state, &mut stack) {
+            /* NEW is transactional: a failing initializer (or a failing
+             * final validation) must not leave a half-built object in
+             * the system. The object was appended last, so removing it
+             * cannot renumber anything else. */
+            if let Some(idx) = state.last_new.take() {
+                state.system.remove_object(idx);
+                state.pending_velocity = None;
+                state.pending_angular_velocity = None;
+                state.pending_torus = None;
+            }
+            return Err(e);
+        }
+    }
+    Ok(stack.pop().unwrap_or(Value::Unit))
+}
+
+fn pop(stack: &mut Vec<Value>) -> Result<Value, String> {
+    stack.pop().ok_or_else(|| "stack underflow (internal error)".to_string())
+}
+
+fn pop_num(stack: &mut Vec<Value>) -> Result<f64, String> {
+    match pop(stack)? {
+        Value::Num(n) => Ok(n),
+        v => Err(format!("expected a number, got {} `{v}`", type_name(&v))),
+    }
+}
+
+fn as_vec3(v: Value) -> Result<Vec3, String> {
+    match v {
+        Value::Vec3(x) => Ok(x),
+        Value::List(items) if items.len() == 3 => {
+            let mut a = [0.0; 3];
+            for (i, it) in items.into_iter().enumerate() {
+                match it {
+                    Value::Num(n) => a[i] = n,
+                    other => return Err(format!("vector component {i} is {}", type_name(&other))),
+                }
+            }
+            Ok(Vec3::from_array(a))
+        }
+        other => Err(format!("expected a vec3 like [x, y, z], got {} `{other}`", type_name(&other))),
+    }
+}
+
+fn as_quat(v: Value) -> Result<Quat, String> {
+    match v {
+        Value::Quat(q) => Ok(q),
+        Value::Vec3(_) => Err("expected a quaternion [w, x, y, z] (4 components)".to_string()),
+        other => Err(format!("expected a quaternion [w, x, y, z], got {} `{other}`", type_name(&other))),
+    }
+}
+
+fn as_mat3(v: Value) -> Result<Mat3, String> {
+    match v {
+        Value::Mat3(m) => Ok(m),
+        Value::Num(n) => Ok(Mat3::from_diagonal(Vec3::new(n, n, n))),
+        other => Err(format!(
+            "expected a mat3 like [[a,b,c],[d,e,f],[g,h,i]] (or a number for a diagonal), got {} `{other}`",
+            type_name(&other)
+        )),
+    }
+}
+
+fn exec_one(instr: &Instr, state: &mut SimState, stack: &mut Vec<Value>) -> Result<(), String> {
+    match instr {
+        Instr::Push(v) => stack.push(v.clone()),
+        Instr::Load(path) => {
+            let v = load_path(state, path)?;
+            stack.push(v);
+        }
+        Instr::Store(path) => {
+            let v = pop(stack)?;
+            store_path(state, path, v)?;
+            stack.push(Value::Unit);
+        }
+        Instr::Add => {
+            let b = pop(stack)?;
+            let a = pop(stack)?;
+            stack.push(binary_add(a, b, "+")?);
+        }
+        Instr::Sub => {
+            let b = pop(stack)?;
+            let a = pop(stack)?;
+            let neg = binary_mul(Value::Num(-1.0), b)?;
+            stack.push(binary_add(a, neg, "-")?);
+        }
+        Instr::Mul => {
+            let b = pop(stack)?;
+            let a = pop(stack)?;
+            stack.push(binary_mul(a, b)?);
+        }
+        Instr::Div => {
+            let b = pop(stack)?;
+            let a = pop(stack)?;
+            match (a, b) {
+                (Value::Num(x), Value::Num(y)) => stack.push(Value::Num(x / y)),
+                (Value::Vec3(v), Value::Num(y)) => stack.push(Value::Vec3(v / y)),
+                (a, b) => {
+                    return Err(format!("cannot divide {} by {}", type_name(&a), type_name(&b)))
+                }
+            }
+        }
+        Instr::Neg => {
+            let a = pop(stack)?;
+            stack.push(binary_mul(Value::Num(-1.0), a)?);
+        }
+        Instr::PackList(n) => {
+            let mut items = Vec::with_capacity(*n);
+            for _ in 0..*n {
+                items.push(pop(stack)?);
+            }
+            items.reverse();
+            let all_num = items.iter().all(|v| matches!(v, Value::Num(_)));
+            let all_vec3 = items.iter().all(|v| matches!(v, Value::Vec3(_)));
+            let packed = if all_num && items.len() == 3 {
+                let nums: Vec<f64> = items
+                    .iter()
+                    .map(|v| if let Value::Num(x) = v { *x } else { 0.0 })
+                    .collect();
+                Value::Vec3(Vec3::new(nums[0], nums[1], nums[2]))
+            } else if all_num && items.len() == 4 {
+                let nums: Vec<f64> = items
+                    .iter()
+                    .map(|v| if let Value::Num(x) = v { *x } else { 0.0 })
+                    .collect();
+                Value::Quat(Quat::new(nums[0], nums[1], nums[2], nums[3]))
+            } else if all_vec3 && items.len() == 3 {
+                let rows: Vec<Vec3> = items
+                    .iter()
+                    .map(|v| if let Value::Vec3(x) = v { *x } else { Vec3::zeros() })
+                    .collect();
+                Value::Mat3(Mat3([
+                    rows[0].to_array(),
+                    rows[1].to_array(),
+                    rows[2].to_array(),
+                ]))
+            } else {
+                Value::List(items)
+            };
+            stack.push(packed);
+        }
+        Instr::Call(name, argc) => {
+            let mut args = Vec::with_capacity(*argc);
+            for _ in 0..*argc {
+                args.push(pop(stack)?);
+            }
+            args.reverse();
+            stack.push(call_builtin(name, args)?);
+        }
+        Instr::NewObject(shape) => {
+            let id = state.system.objects.len();
+            let obj = match shape {
+                ShapeKind::Point => {
+                    physical_object::new_point(id, 1.0, Vec3::zeros(), Vec3::zeros())
+                }
+                ShapeKind::Sphere => physical_object::new_from_shape(
+                    id,
+                    1.0,
+                    0.0,
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Boundary::Sphere { radius: 1.0 },
+                ),
+                ShapeKind::Cuboid => physical_object::new_from_shape(
+                    id,
+                    1.0,
+                    0.0,
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Boundary::Cuboid { half_extents: [1.0, 1.0, 1.0] },
+                ),
+                ShapeKind::Torus => physical_object::new_from_shape(
+                    id,
+                    1.0,
+                    0.0,
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Boundary::Torus { ring_radius: 1.0, tube_radius: 0.25 },
+                ),
+                ShapeKind::Disk => physical_object::new_from_shape(
+                    id,
+                    1.0,
+                    0.0,
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Boundary::Disk { radius: 1.0 },
+                ),
+                ShapeKind::Cylinder => physical_object::new_from_shape(
+                    id,
+                    1.0,
+                    0.0,
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Boundary::Cylinder { radius: 0.5, half_height: 1.0 },
+                ),
+            };
+            let idx = state.system.add_object(obj);
+            state.last_new = Some(idx);
+            state.pending_velocity = None;
+            state.pending_angular_velocity = None;
+            state.pending_torus = None;
+        }
+        Instr::InitField(field) => {
+            let v = pop(stack)?;
+            let idx = state
+                .last_new
+                .ok_or_else(|| "internal error: initializer outside NEW".to_string())?;
+            match field.as_str() {
+                /* velocity-like inits are deferred until mass/inertia
+                 * are final (initializer order must not matter) */
+                "velocity" => state.pending_velocity = Some(as_vec3(v)?),
+                "angular_velocity" => state.pending_angular_velocity = Some(as_vec3(v)?),
+                /* torus geometry is deferred and resolved ONCE in
+                 * FinishNew, so the inner_radius + outer_radius pair is
+                 * genuinely order-independent (validating each write
+                 * against a half-updated default would make one order
+                 * fail where the other succeeds) */
+                "ring_radius" | "tube_radius" | "inner_radius" | "outer_radius"
+                    if matches!(
+                        state.system.objects.get(idx).map(|o| o.get_boundary()),
+                        Some(Boundary::Torus { .. })
+                    ) =>
+                {
+                    let n = match v {
+                        Value::Num(n) => n,
+                        v => {
+                            return Err(format!(
+                                "{field} expects a number, got {}",
+                                type_name(&v)
+                            ))
+                        }
+                    };
+                    let lo_ok = if field == "inner_radius" { n >= 0.0 } else { n > 0.0 };
+                    if !(n.is_finite() && lo_ok) {
+                        return Err(format!(
+                            "{field} must be a finite number {} 0, got {n}",
+                            if field == "inner_radius" { ">=" } else { ">" }
+                        ));
+                    }
+                    let slot = match field.as_str() {
+                        "ring_radius" => 0,
+                        "tube_radius" => 1,
+                        "inner_radius" => 2,
+                        _ => 3,
+                    };
+                    state.pending_torus.get_or_insert([None; 4])[slot] = Some(n);
+                }
+                _ => {
+                    let path = Path {
+                        root: PathRoot::Object(idx),
+                        field: field.clone(),
+                        comp: None,
+                    };
+                    store_path(state, &path, v)?;
+                }
+            }
+        }
+        Instr::FinishNew { recompute_inertia } => {
+            let idx = state
+                .last_new
+                .ok_or_else(|| "internal error: FinishNew outside NEW".to_string())?;
+            /* Resolve deferred torus geometry: apply ring/tube first,
+             * then let inner/outer override the derived pair — all
+             * validated ONCE against the FINAL values (an error here
+             * rolls the whole NEW back in `execute`). */
+            if let Some(p) = state.pending_torus.take() {
+                if let Some(o) = state.system.objects.get_mut(idx) {
+                    let (ring0, tube0) = match o.get_boundary() {
+                        Boundary::Torus { ring_radius, tube_radius } => (ring_radius, tube_radius),
+                        _ => (1.0, 0.25),
+                    };
+                    let ring1 = p[0].unwrap_or(ring0);
+                    let tube1 = p[1].unwrap_or(tube0);
+                    let inner = p[2].unwrap_or(ring1 - tube1);
+                    let outer = p[3].unwrap_or(ring1 + tube1);
+                    if !(0.0 <= inner && inner < outer) {
+                        return Err(format!(
+                            "torus needs 0 <= inner < outer (got inner = {inner}, outer = {outer})"
+                        ));
+                    }
+                    o.set_boundary(Boundary::Torus {
+                        ring_radius: 0.5 * (inner + outer),
+                        tube_radius: 0.5 * (outer - inner),
+                    });
+                }
+            }
+            state.last_new = None;
+            if *recompute_inertia {
+                if let Some(o) = state.system.objects.get_mut(idx) {
+                    if o.get_boundary() != Boundary::Point {
+                        o.recompute_inertia_from_boundary();
+                    }
+                }
+            }
+            let pv = state.pending_velocity.take();
+            let pw = state.pending_angular_velocity.take();
+            if let Some(o) = state.system.objects.get_mut(idx) {
+                if let Some(v) = pv {
+                    o.set_velocity(v);
+                }
+                if let Some(w) = pw {
+                    o.set_angular_velocity(w);
+                }
+            }
+            stack.push(Value::Str(format!("obj{idx}")));
+        }
+        Instr::Delete(i) => {
+            if state.system.remove_object(*i).is_none() {
+                return Err(format!("no object obj{i}"));
+            }
+            /* keep the wall-slab index list in sync with renumbering */
+            state.wall_indices.retain(|w| w != i);
+            for w in &mut state.wall_indices {
+                if *w > *i {
+                    *w -= 1;
+                }
+            }
+            if state.wall_indices.len() < 6 && state.box_size.is_some() {
+                state.box_size = None; // a wall was deleted: no closed box anymore
+            }
+            stack.push(Value::Str(format!(
+                "deleted obj{i}; {} object(s) remain (indices renumbered)",
+                state.system.objects.len()
+            )));
+        }
+        Instr::ListObjects => {
+            let mut out = String::new();
+            if state.system.objects.is_empty() {
+                out.push_str("(no objects)");
+            }
+            for (i, o) in state.system.objects.iter().enumerate() {
+                let shape = match o.get_boundary() {
+                    Boundary::Point => "point".to_string(),
+                    Boundary::Sphere { radius } => format!("sphere r={radius}"),
+                    Boundary::Cuboid { half_extents } => format!(
+                        "cuboid he=[{}, {}, {}]",
+                        half_extents[0], half_extents[1], half_extents[2]
+                    ),
+                    Boundary::Torus { ring_radius, tube_radius } => {
+                        format!("torus ring={ring_radius} tube={tube_radius}")
+                    }
+                    Boundary::Disk { radius } => format!("disk r={radius}"),
+                    Boundary::Cylinder { radius, half_height } => {
+                        format!("cylinder r={radius} h={}", 2.0 * half_height)
+                    }
+                };
+                let p = o.get_position();
+                if i > 0 {
+                    out.push('\n');
+                }
+                /* static bodies (inverse mass 0) are flagged; the six
+                 * BOX slabs additionally read "[wall]" */
+                let tag = if state.wall_indices.contains(&i) {
+                    " [wall: static, inverse_mass=0]"
+                } else if o.get_inverse_mass() == 0.0 {
+                    " [static, inverse_mass=0]"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "obj{i}: {shape}, mass={}, charge={}, pos=[{}, {}, {}]{tag}",
+                    o.get_mass(),
+                    o.get_charge(),
+                    p.x,
+                    p.y,
+                    p.z
+                ));
+            }
+            stack.push(Value::Str(out));
+        }
+        Instr::Step => {
+            let dt = pop_num(stack)?;
+            let report = sundials_step(&mut state.system, dt)?;
+            /* the collision suffix appears only when something collided,
+             * so collision-free output keeps its historical shape */
+            let coll = if report.ncollisions > 0 {
+                format!(", {} collision(s) — CONTACTS lists them", report.ncollisions)
+            } else {
+                String::new()
+            };
+            stack.push(Value::Str(format!(
+                "t = {} (advanced by {dt}, {} solver steps{coll})",
+                state.system.time, report.nst
+            )));
+        }
+        Instr::Run { outputs } => {
+            let duration = pop_num(stack)?;
+            let e0 = state.system.total_energy();
+            let t_end = state.system.time + duration;
+            let report = sundials_run(&mut state.system, t_end, *outputs)?;
+            let e1 = state.system.total_energy();
+            let drift = if e0 != 0.0 { ((e1 - e0) / e0).abs() } else { (e1 - e0).abs() };
+            let coll = if report.ncollisions > 0 {
+                format!(", {} collision(s) — CONTACTS lists them", report.ncollisions)
+            } else {
+                String::new()
+            };
+            stack.push(Value::Str(format!(
+                "t = {} ({} solver steps, {} snapshots, |dE/E| = {:.3e}{coll})",
+                state.system.time,
+                report.nst,
+                report.snapshots.len(),
+                drift
+            )));
+        }
+        Instr::SetMethod(spec) => {
+            let (method, desc) = match spec {
+                MethodSpec::Adams => (Method::Adams, "CVODE Adams".to_string()),
+                MethodSpec::Bdf => (Method::Bdf, "CVODE BDF".to_string()),
+                MethodSpec::Sprk { table, dt } => (
+                    Method::Sprk { table: table.clone(), dt: *dt },
+                    format!("ARKODE SPRK {table}, fixed dt = {dt}"),
+                ),
+            };
+            state.system.method = method;
+            stack.push(Value::Str(format!("method = {desc}")));
+        }
+        Instr::Energy => stack.push(Value::Num(state.system.total_energy())),
+        Instr::CenterOfMass => stack.push(Value::Vec3(state.system.center_of_mass())),
+        Instr::TotalMomentum => stack.push(Value::Vec3(state.system.total_momentum())),
+        Instr::TotalAngularMomentum => {
+            stack.push(Value::Vec3(state.system.total_angular_momentum(Vec3::zeros())))
+        }
+        Instr::Laplace(i) => match state.system.laplace_vector(*i) {
+            Some(v) => stack.push(Value::Vec3(v)),
+            None => return Err(format!("no object obj{i}")),
+        },
+        Instr::Reset => {
+            /* the scene window survives a RESET: it re-syncs to the
+             * (now empty) system instead of closing */
+            let scene = state.scene.take();
+            let machine_mode = state.machine_mode;
+            *state = SimState::default();
+            state.machine_mode = machine_mode;
+            if let Some(s) = scene {
+                s.sync(&state.system)?;
+                /* the fresh state has no box: clear the window's box
+                 * wireframe and wall flags too */
+                s.set_box(state.box_size, &state.wall_indices)?;
+                state.scene = Some(s);
+            }
+            stack.push(Value::Str("system reset".to_string()));
+        }
+        Instr::Help => stack.push(Value::Str(HELP_TEXT.to_string())),
+        Instr::Scene(cmd) => {
+            let out = exec_scene(cmd, state, stack)?;
+            stack.push(Value::Str(out));
+        }
+        Instr::Collide(mode) => {
+            if let Some(on) = mode {
+                state.system.collide_enabled = *on;
+            }
+            let pairs = ::physical_object::collide::collidable_pairs(&state.system);
+            stack.push(Value::Str(format!(
+                "collisions {} ({} collidable pair(s); {} impulse(s) so far)",
+                if state.system.collide_enabled { "ON" } else { "OFF" },
+                pairs.len(),
+                state.system.collision_count
+            )));
+        }
+        Instr::Contacts => {
+            if state.system.contacts.is_empty() {
+                stack.push(Value::Str(
+                    "(no contacts recorded in the last STEP/RUN)".to_string(),
+                ));
+            } else {
+                let mut out = String::new();
+                for (k, c) in state.system.contacts.iter().enumerate() {
+                    if k > 0 {
+                        out.push('\n');
+                    }
+                    out.push_str(&format!(
+                        "contact{k}: obj{} <-> obj{} at t = {}\n  point  = [{}, {}, {}]\n  \
+                         normal = [{}, {}, {}]  (from obj{} toward obj{})\n  \
+                         depth = {}, approach speed = {}, impulse = {}",
+                        c.i, c.j, c.t,
+                        c.point.x, c.point.y, c.point.z,
+                        c.normal.x, c.normal.y, c.normal.z, c.i, c.j,
+                        c.depth, -c.rel_vel_n, c.impulse_n
+                    ));
+                }
+                stack.push(Value::Str(out));
+            }
+        }
+        Instr::Box(mode) => {
+            let out = exec_box(*mode, state, stack)?;
+            stack.push(Value::Str(out));
+        }
+    }
+    Ok(())
+}
+
+/// `BOX <size>` / `BOX OFF` / `BOX` — the rigid, **infinitely massive**
+/// bounding box. Infinite mass enters the dynamics only as inverse
+/// mass zero (the equations of motion and the contact impulse use
+/// `m⁻¹`, never `m`): each of the six wall slabs is a static
+/// `Boundary::Cuboid` object with `inverse_mass = 0` and zero inverse
+/// inertia, so it contributes nothing to the impulse denominator
+/// `n·K n = m_i⁻¹ + m_j⁻¹ + (angular terms)` and receives no state
+/// writes — bodies bounce off the inside faces elastically while the
+/// walls stay bit-identically at rest.
+fn exec_box(mode: BoxMode, state: &mut SimState, stack: &mut Vec<Value>) -> Result<String, String> {
+    let remove_walls = |state: &mut SimState| {
+        let mut idx = state.wall_indices.clone();
+        idx.sort_unstable();
+        for &i in idx.iter().rev() {
+            state.system.remove_object(i);
+        }
+        state.wall_indices.clear();
+        state.box_size = None;
+        idx.len()
+    };
+    match mode {
+        BoxMode::Status => Ok(match state.box_size {
+            Some(s) => format!(
+                "box: inner size {s} x {s} x {s}, six static walls {} (inverse_mass = 0)",
+                state
+                    .wall_indices
+                    .iter()
+                    .map(|i| format!("obj{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None if !state.wall_indices.is_empty() => format!(
+                "box: dissolved (a wall was deleted; {} tracked slab(s) remain — \
+                 BOX <size> replaces them, BOX OFF removes them)",
+                state.wall_indices.len()
+            ),
+            None => "box: none (BOX <size> creates one)".to_string(),
+        }),
+        BoxMode::Off => {
+            if state.box_size.is_none() && state.wall_indices.is_empty() {
+                return Ok("box: none".to_string());
+            }
+            let n = remove_walls(state);
+            Ok(format!("box removed ({n} wall(s) deleted, indices renumbered)"))
+        }
+        BoxMode::Create => {
+            let size = match stack.pop() {
+                Some(Value::Num(n)) => n,
+                Some(v) => return Err(format!("BOX expects a number, got {}", type_name(&v))),
+                None => return Err("BOX needs a size (the inner side length)".to_string()),
+            };
+            if !(size.is_finite() && size > 0.0) {
+                return Err(format!("BOX size must be a finite number > 0, got {size}"));
+            }
+            /* remove tracked slabs even when the box was dissolved by a
+             * wall deletion — recreating must never leak orphans */
+            let replaced = if state.box_size.is_some() || !state.wall_indices.is_empty() {
+                remove_walls(state)
+            } else {
+                0
+            };
+            let half = 0.5 * size; // inner half-extent
+            let t = 0.5 * half; // slab half-thickness
+            let big = half + 2.0 * t; // slab cross-section: covers the corners
+            let c = half + t; // slab center distance from the origin
+            let slabs: [([f64; 3], Vec3); 6] = [
+                ([t, big, big], Vec3::new(c, 0.0, 0.0)),
+                ([t, big, big], Vec3::new(-c, 0.0, 0.0)),
+                ([big, t, big], Vec3::new(0.0, c, 0.0)),
+                ([big, t, big], Vec3::new(0.0, -c, 0.0)),
+                ([big, big, t], Vec3::new(0.0, 0.0, c)),
+                ([big, big, t], Vec3::new(0.0, 0.0, -c)),
+            ];
+            let mut names = Vec::new();
+            for (h, pos) in slabs {
+                let id = state.system.objects.len();
+                let mut wall = physical_object::new_from_shape(
+                    id,
+                    1.0,
+                    0.0,
+                    pos,
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Boundary::Cuboid { half_extents: h },
+                );
+                /* infinite mass, the only way the math ever sees it */
+                wall.set_inverse_mass(0.0);
+                wall.set_inverse_inertia_tensor(Mat3::zeros());
+                let idx = state.system.add_object(wall);
+                state.wall_indices.push(idx);
+                names.push(format!("obj{idx}"));
+            }
+            state.box_size = Some(size);
+            let replaced_note =
+                if replaced > 0 { " (replacing the previous box)" } else { "" };
+            let scene_note = if state.scene.is_some() {
+                "\n(scene window open: SCENE REFRESH shows the box)"
+            } else {
+                ""
+            };
+            Ok(format!(
+                "box: inner size {size} x {size} x {size}{replaced_note} — six static walls \
+                 {} with inverse_mass = 0 (infinitely massive); objects collide elastically \
+                 off the inside faces{scene_note}",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+/// Executes one `SCENE` sub-command. Every command except `CREATE`
+/// needs an open scene window.
+fn exec_scene(cmd: &SceneCmd, state: &mut SimState, stack: &mut Vec<Value>) -> Result<String, String> {
+    use crate::scene::{RunMode, SceneHandle};
+
+    if let SceneCmd::Create { port } = cmd {
+        if let Some(s) = &state.scene {
+            return Ok(format!(
+                "scene already open at {} — SCENE REFRESH re-syncs it, SCENE CLOSE closes it",
+                s.url
+            ));
+        }
+        let handle = SceneHandle::start(state.system.clone(), *port, state.machine_mode, true)?;
+        handle.set_box(state.box_size, &state.wall_indices)?;
+        let url = handle.url.clone();
+        state.scene = Some(handle);
+        return Ok(format!(
+            "scene window created: {url}\n\
+             (opened in your browser; if no window appeared, open that address yourself)\n\
+             showing {} entit{}; SCENE START begins the evolution — HELP lists all scene commands",
+            state.system.objects.len(),
+            if state.system.objects.len() == 1 { "y" } else { "ies" },
+        ));
+    }
+    if matches!(cmd, SceneCmd::Close) {
+        return match state.scene.take() {
+            Some(s) => {
+                let url = s.url.clone();
+                drop(s);
+                Ok(format!("scene closed ({url})"))
+            }
+            None => Err("no scene window is open".to_string()),
+        };
+    }
+
+    let scene = state
+        .scene
+        .as_ref()
+        .ok_or_else(|| "no scene window — run SCENE CREATE first".to_string())?;
+    match cmd {
+        SceneCmd::Create { .. } | SceneCmd::Close => unreachable!("handled above"),
+        SceneCmd::Translate => {
+            let dz = pop_num(stack)?;
+            let dy = pop_num(stack)?;
+            let dx = pop_num(stack)?;
+            scene.translate(dx, dy, dz)
+        }
+        SceneCmd::Rotate => {
+            let dpitch = pop_num(stack)?;
+            let dyaw = pop_num(stack)?;
+            scene.rotate(dyaw, dpitch)
+        }
+        SceneCmd::Zoom => {
+            let f = pop_num(stack)?;
+            scene.zoom(f)
+        }
+        SceneCmd::ZoomIn => scene.zoom(1.25),
+        SceneCmd::ZoomOut => scene.zoom(1.0 / 1.25),
+        SceneCmd::Hide(which) => scene.set_visibility(*which, true),
+        SceneCmd::Show(which) => scene.set_visibility(*which, false),
+        SceneCmd::Refresh => {
+            scene.sync(&state.system)?;
+            scene.set_box(state.box_size, &state.wall_indices)?;
+            Ok(format!(
+                "scene refreshed from the notebook state ({} entities, t = {})",
+                state.system.objects.len(),
+                state.system.time
+            ))
+        }
+        SceneCmd::Redraw => {
+            scene.redraw()?;
+            Ok("scene redraw queued for every window".to_string())
+        }
+        SceneCmd::Start => scene.set_mode(RunMode::Running),
+        SceneCmd::Stop => scene.set_mode(RunMode::Stopped),
+        SceneCmd::Pause => scene.set_mode(RunMode::Paused),
+        SceneCmd::Reverse => scene.set_mode(RunMode::Reversing),
+        SceneCmd::SetTimeStep => {
+            let dt = pop_num(stack)?;
+            scene.set_dt(dt)
+        }
+        SceneCmd::Status => scene.status(),
+        SceneCmd::Events => {
+            let events = scene.drain_events()?;
+            if events.is_empty() {
+                Ok("(no scene events)".to_string())
+            } else {
+                Ok(events.join("\n"))
+            }
+        }
+    }
+}
+
+fn binary_add(a: Value, b: Value, op: &str) -> Result<Value, String> {
+    match (a, b) {
+        (Value::Num(x), Value::Num(y)) => Ok(Value::Num(x + y)),
+        (Value::Vec3(x), Value::Vec3(y)) => Ok(Value::Vec3(x + y)),
+        (Value::Quat(x), Value::Quat(y)) => Ok(Value::Quat(x + y)),
+        (a, b) => Err(format!(
+            "cannot apply `{op}` to {} and {} (for vectors use dot()/cross())",
+            type_name(&a),
+            type_name(&b)
+        )),
+    }
+}
+
+fn binary_mul(a: Value, b: Value) -> Result<Value, String> {
+    match (a, b) {
+        (Value::Num(x), Value::Num(y)) => Ok(Value::Num(x * y)),
+        (Value::Num(x), Value::Vec3(v)) | (Value::Vec3(v), Value::Num(x)) => Ok(Value::Vec3(v * x)),
+        (Value::Num(x), Value::Quat(q)) | (Value::Quat(q), Value::Num(x)) => Ok(Value::Quat(q * x)),
+        (Value::Num(x), Value::Mat3(m)) | (Value::Mat3(m), Value::Num(x)) => Ok(Value::Mat3(m * x)),
+        (Value::Mat3(m), Value::Vec3(v)) => Ok(Value::Vec3(m * v)),
+        (Value::Mat3(m), Value::Mat3(n)) => Ok(Value::Mat3(m * n)),
+        (Value::Quat(p), Value::Quat(q)) => Ok(Value::Quat(p * q)),
+        (a, b) => Err(format!(
+            "cannot multiply {} by {} (for vec3*vec3 use dot()/cross())",
+            type_name(&a),
+            type_name(&b)
+        )),
+    }
+}
+
+fn call_builtin(name: &str, mut args: Vec<Value>) -> Result<Value, String> {
+    let arity_err = |want: usize, got: usize| {
+        Err::<Value, String>(format!("{name}() takes {want} argument(s), got {got}"))
+    };
+    let num1 = |args: &mut Vec<Value>| -> Result<f64, String> {
+        match args.remove(0) {
+            Value::Num(n) => Ok(n),
+            v => Err(format!("{} expects a number, got {}", "builtin", type_name(&v))),
+        }
+    };
+    match name {
+        "dot" => {
+            if args.len() != 2 {
+                return arity_err(2, args.len());
+            }
+            let a = as_vec3(args.remove(0))?;
+            let b = as_vec3(args.remove(0))?;
+            Ok(Value::Num(a.dot(b)))
+        }
+        "cross" => {
+            if args.len() != 2 {
+                return arity_err(2, args.len());
+            }
+            let a = as_vec3(args.remove(0))?;
+            let b = as_vec3(args.remove(0))?;
+            Ok(Value::Vec3(a.cross(b)))
+        }
+        "norm" => {
+            if args.len() != 1 {
+                return arity_err(1, args.len());
+            }
+            match args.remove(0) {
+                Value::Vec3(v) => Ok(Value::Num(v.norm())),
+                Value::Quat(q) => Ok(Value::Num(q.norm())),
+                Value::Num(n) => Ok(Value::Num(n.abs())),
+                v => Err(format!("norm() expects a vector, got {}", type_name(&v))),
+            }
+        }
+        "normalize" => {
+            if args.len() != 1 {
+                return arity_err(1, args.len());
+            }
+            Ok(Value::Vec3(as_vec3(args.remove(0))?.normalize()))
+        }
+        "sqrt" | "abs" | "sin" | "cos" | "exp" | "log" => {
+            if args.len() != 1 {
+                return arity_err(1, args.len());
+            }
+            let x = num1(&mut args)?;
+            let y = match name {
+                "sqrt" => x.sqrt(),
+                "abs" => x.abs(),
+                "sin" => x.sin(),
+                "cos" => x.cos(),
+                "exp" => x.exp(),
+                _ => x.ln(),
+            };
+            Ok(Value::Num(y))
+        }
+        other => Err(format!("unknown function `{other}()` — see HELP")),
+    }
+}
+
+fn get_object<'a>(state: &'a SimState, i: usize) -> Result<&'a physical_object, String> {
+    state.system.objects.get(i).ok_or_else(|| format!("no object obj{i}"))
+}
+
+fn component(v: Vec3, c: usize) -> Result<Value, String> {
+    match c {
+        0 => Ok(Value::Num(v.x)),
+        1 => Ok(Value::Num(v.y)),
+        2 => Ok(Value::Num(v.z)),
+        _ => Err("component `.w` only exists on quaternions".to_string()),
+    }
+}
+
+fn apply_comp(base: Value, comp: Option<usize>, path: &Path) -> Result<Value, String> {
+    let Some(c) = comp else { return Ok(base) };
+    match base {
+        Value::Vec3(v) => component(v, c),
+        Value::Quat(q) => Ok(Value::Num([q.w, q.x, q.y, q.z][match c {
+            3 => 0, /* .w */
+            0 => 1,
+            1 => 2,
+            _ => 3,
+        }])),
+        other => Err(format!("`{path}`: {} has no components", type_name(&other))),
+    }
+}
+
+fn load_path(state: &SimState, path: &Path) -> Result<Value, String> {
+    let base = match &path.root {
+        PathRoot::System => match path.field.as_str() {
+            "g_constant" | "g" => Value::Num(state.system.g_constant),
+            "softening" => Value::Num(state.system.softening),
+            "uniform_gravity" | "gravity" => Value::Vec3(state.system.uniform_gravity),
+            "e_field" => Value::Vec3(state.system.e_field),
+            "b_field" => Value::Vec3(state.system.b_field),
+            "rtol" => Value::Num(state.system.rtol),
+            "atol" => Value::Num(state.system.atol),
+            "time" | "t" => Value::Num(state.system.time),
+            "method" => Value::Str(format!("{:?}", state.system.method)),
+            "count" | "n" => Value::Num(state.system.objects.len() as f64),
+            "collide" => Value::Num(if state.system.collide_enabled { 1.0 } else { 0.0 }),
+            "contacts" => Value::Num(state.system.contacts.len() as f64),
+            "collisions" => Value::Num(state.system.collision_count as f64),
+            "restitution_threshold" => Value::Num(state.system.restitution_threshold),
+            "contact_slop" => Value::Num(state.system.contact_slop),
+            "box" => Value::Num(state.box_size.unwrap_or(0.0)),
+            other => {
+                return Err(format!(
+                    "unknown system field `{other}` (g_constant, softening, uniform_gravity, \
+                     e_field, b_field, rtol, atol, time, method, count, collide, contacts, \
+                     collisions, restitution_threshold, contact_slop, box)"
+                ))
+            }
+        },
+        PathRoot::Object(i) => {
+            let o = get_object(state, *i)?;
+            match path.field.as_str() {
+                "id" => Value::Num(o.get_id() as f64),
+                "mass" => Value::Num(o.get_mass()),
+                "inverse_mass" => Value::Num(o.get_inverse_mass()),
+                "charge" => Value::Num(o.get_charge()),
+                "position" | "pos" => Value::Vec3(o.get_position()),
+                "velocity" | "vel" => Value::Vec3(o.get_velocity()),
+                "momentum" => Value::Vec3(o.get_momentum()),
+                "orientation" => Value::Quat(o.get_orientation()),
+                "angular_velocity" => Value::Vec3(o.get_angular_velocity()),
+                "angular_momentum" => Value::Vec3(o.get_angular_momentum()),
+                "inertia_tensor" => Value::Mat3(o.get_inertia_tensor()),
+                "inverse_inertia_tensor" => Value::Mat3(o.get_inverse_inertia_tensor()),
+                "magnetic_moment_tensor" => Value::Mat3(o.get_magnetic_moment_tensor()),
+                "kinetic_energy" | "energy" => Value::Num(o.kinetic_energy()),
+                "boundary" | "shape" => Value::Str(format!("{:?}", o.get_boundary())),
+                "radius" => match o.get_boundary() {
+                    Boundary::Sphere { radius }
+                    | Boundary::Disk { radius }
+                    | Boundary::Cylinder { radius, .. } => Value::Num(radius),
+                    b => {
+                        return Err(format!(
+                            "obj{i} has no radius (boundary = {b:?}; radius reads a sphere, \
+                             disk or cylinder)"
+                        ))
+                    }
+                },
+                "half_extents" => match o.get_boundary() {
+                    Boundary::Cuboid { half_extents } => Value::Vec3(Vec3::from_array(half_extents)),
+                    b => return Err(format!("obj{i} is not a cuboid (boundary = {b:?})")),
+                },
+                "ring_radius" => match o.get_boundary() {
+                    Boundary::Torus { ring_radius, .. } => Value::Num(ring_radius),
+                    b => return Err(format!("obj{i} is not a torus (boundary = {b:?})")),
+                },
+                "tube_radius" => match o.get_boundary() {
+                    Boundary::Torus { tube_radius, .. } => Value::Num(tube_radius),
+                    b => return Err(format!("obj{i} is not a torus (boundary = {b:?})")),
+                },
+                "inner_radius" => match o.get_boundary() {
+                    Boundary::Torus { ring_radius, tube_radius } => {
+                        Value::Num(ring_radius - tube_radius)
+                    }
+                    b => return Err(format!("obj{i} is not a torus (boundary = {b:?})")),
+                },
+                "outer_radius" => match o.get_boundary() {
+                    Boundary::Torus { ring_radius, tube_radius } => {
+                        Value::Num(ring_radius + tube_radius)
+                    }
+                    b => return Err(format!("obj{i} is not a torus (boundary = {b:?})")),
+                },
+                "height" | "half_height" => match o.get_boundary() {
+                    Boundary::Cylinder { half_height, .. } => {
+                        if path.field == "height" {
+                            Value::Num(2.0 * half_height)
+                        } else {
+                            Value::Num(half_height)
+                        }
+                    }
+                    b => return Err(format!("obj{i} is not a cylinder (boundary = {b:?})")),
+                },
+                "force" => Value::Vec3(state.system.external_forces[*i]),
+                "torque" => Value::Vec3(state.system.external_torques[*i]),
+                "restitution" => Value::Num(o.get_restitution()),
+                other => {
+                    return Err(format!(
+                        "unknown object field `{other}` — see HELP for the field list"
+                    ))
+                }
+            }
+        }
+        PathRoot::Contact(k) => {
+            let c = state.system.contacts.get(*k).ok_or_else(|| {
+                format!(
+                    "no contact{k} — the last STEP/RUN recorded {} contact(s); \
+                     CONTACTS lists them",
+                    state.system.contacts.len()
+                )
+            })?;
+            match path.field.as_str() {
+                "i" => Value::Num(c.i as f64),
+                "j" => Value::Num(c.j as f64),
+                "t" | "time" => Value::Num(c.t),
+                "point" => Value::Vec3(c.point),
+                "normal" => Value::Vec3(c.normal),
+                "depth" => Value::Num(c.depth),
+                "rel_vel_n" | "approach" => Value::Num(c.rel_vel_n),
+                "impulse" | "impulse_n" => Value::Num(c.impulse_n),
+                other => {
+                    return Err(format!(
+                        "unknown contact field `{other}` (i, j, t, point, normal, depth, \
+                         rel_vel_n, impulse)"
+                    ))
+                }
+            }
+        }
+    };
+    apply_comp(base, path.comp, path)
+}
+
+fn store_path(state: &mut SimState, path: &Path, value: Value) -> Result<(), String> {
+    /* component store: read-modify-write through the full-field API */
+    if let Some(c) = path.comp {
+        let full = Path { comp: None, ..path.clone() };
+        let base = load_path(state, &full)?;
+        let n = match value {
+            Value::Num(n) => n,
+            v => return Err(format!("component store expects a number, got {}", type_name(&v))),
+        };
+        let updated = match base {
+            Value::Vec3(mut v) => {
+                match c {
+                    0 => v.x = n,
+                    1 => v.y = n,
+                    2 => v.z = n,
+                    _ => return Err("component `.w` only exists on quaternions".to_string()),
+                }
+                Value::Vec3(v)
+            }
+            Value::Quat(mut q) => {
+                match c {
+                    3 => q.w = n,
+                    0 => q.x = n,
+                    1 => q.y = n,
+                    _ => q.z = n,
+                }
+                Value::Quat(q)
+            }
+            other => return Err(format!("`{path}`: {} has no components", type_name(&other))),
+        };
+        return store_path(state, &full, updated);
+    }
+
+    match &path.root {
+        PathRoot::System => {
+            let num = |v: Value| match v {
+                Value::Num(n) => Ok(n),
+                v => Err(format!("system.{} expects a number, got {}", path.field, type_name(&v))),
+            };
+            match path.field.as_str() {
+                "g_constant" | "g" => state.system.g_constant = num(value)?,
+                "softening" => state.system.softening = num(value)?,
+                "uniform_gravity" | "gravity" => state.system.uniform_gravity = as_vec3(value)?,
+                "e_field" => state.system.e_field = as_vec3(value)?,
+                "b_field" => state.system.b_field = as_vec3(value)?,
+                "rtol" => state.system.rtol = num(value)?,
+                "atol" => state.system.atol = num(value)?,
+                "time" | "t" => state.system.time = num(value)?,
+                "restitution_threshold" => {
+                    let v = num(value)?;
+                    if !(v.is_finite() && v >= 0.0) {
+                        return Err("restitution_threshold must be a finite number >= 0".into());
+                    }
+                    state.system.restitution_threshold = v;
+                }
+                "contact_slop" => {
+                    let v = num(value)?;
+                    if !(v.is_finite() && v >= 0.0) {
+                        return Err("contact_slop must be a finite number >= 0".into());
+                    }
+                    state.system.contact_slop = v;
+                }
+                "collide" => {
+                    return Err(
+                        "use COLLIDE ON / COLLIDE OFF to switch collision detection".into()
+                    )
+                }
+                other => {
+                    return Err(format!(
+                        "system field `{other}` is not writable (or unknown) — see HELP"
+                    ))
+                }
+            }
+        }
+        PathRoot::Object(i) => {
+            let i = *i;
+            if i >= state.system.objects.len() {
+                return Err(format!("no object obj{i}"));
+            }
+            let num = |v: Value| match v {
+                Value::Num(n) => Ok(n),
+                v => Err(format!("obj.{} expects a number, got {}", path.field, type_name(&v))),
+            };
+            match path.field.as_str() {
+                "id" => {
+                    let n = num(value)?;
+                    state.system.objects[i].set_id(n as usize);
+                }
+                "mass" => {
+                    let n = num(value)?;
+                    state.system.objects[i].set_mass(n);
+                }
+                "inverse_mass" => {
+                    let n = num(value)?;
+                    state.system.objects[i].set_inverse_mass(n);
+                }
+                "charge" => {
+                    let n = num(value)?;
+                    state.system.objects[i].set_charge(n);
+                }
+                "position" | "pos" => {
+                    let v = as_vec3(value)?;
+                    state.system.objects[i].set_position(v);
+                }
+                "velocity" | "vel" => {
+                    let v = as_vec3(value)?;
+                    state.system.objects[i].set_velocity(v);
+                }
+                "momentum" => {
+                    let v = as_vec3(value)?;
+                    state.system.objects[i].set_momentum(v);
+                }
+                "orientation" => {
+                    let q = as_quat(value)?;
+                    state.system.objects[i].set_orientation(q);
+                }
+                "angular_velocity" => {
+                    let v = as_vec3(value)?;
+                    state.system.objects[i].set_angular_velocity(v);
+                }
+                "angular_momentum" => {
+                    let v = as_vec3(value)?;
+                    state.system.objects[i].set_angular_momentum(v);
+                }
+                "inertia_tensor" => {
+                    let m = as_mat3(value)?;
+                    state.system.objects[i].set_inertia_tensor(m);
+                }
+                "inverse_inertia_tensor" => {
+                    let m = as_mat3(value)?;
+                    state.system.objects[i].set_inverse_inertia_tensor(m);
+                }
+                "magnetic_moment_tensor" => {
+                    let m = as_mat3(value)?;
+                    state.system.objects[i].set_magnetic_moment_tensor(m);
+                }
+                "radius" => {
+                    let r = num(value)?;
+                    if !(r.is_finite() && r > 0.0) {
+                        return Err(format!("radius must be a finite number > 0, got {r}"));
+                    }
+                    /* radius keeps the shape family: a disk stays a
+                     * disk, a cylinder keeps its height; a torus is
+                     * refused (it has two radii — mirroring the read
+                     * side); anything else becomes a sphere (the
+                     * historical behavior) */
+                    let b = match state.system.objects[i].get_boundary() {
+                        Boundary::Disk { .. } => Boundary::Disk { radius: r },
+                        Boundary::Cylinder { half_height, .. } => {
+                            Boundary::Cylinder { radius: r, half_height }
+                        }
+                        Boundary::Torus { .. } => {
+                            return Err(format!(
+                                "obj{i} is a torus — set ring_radius/tube_radius or \
+                                 inner_radius/outer_radius instead of radius"
+                            ))
+                        }
+                        _ => Boundary::Sphere { radius: r },
+                    };
+                    state.system.objects[i].set_boundary(b);
+                    state.system.objects[i].recompute_inertia_from_boundary();
+                }
+                "half_extents" => {
+                    let v = as_vec3(value)?;
+                    state.system.objects[i].set_boundary(Boundary::Cuboid {
+                        half_extents: v.to_array(),
+                    });
+                    state.system.objects[i].recompute_inertia_from_boundary();
+                }
+                "ring_radius" | "tube_radius" | "inner_radius" | "outer_radius" => {
+                    let n = num(value)?;
+                    /* inner_radius admits 0 — the horn torus is a valid
+                     * body (readable via GET, so writable too) */
+                    let lo_ok = if path.field == "inner_radius" { n >= 0.0 } else { n > 0.0 };
+                    if !(n.is_finite() && lo_ok) {
+                        return Err(format!(
+                            "{} must be a finite number {} 0, got {n}",
+                            path.field,
+                            if path.field == "inner_radius" { ">=" } else { ">" }
+                        ));
+                    }
+                    let (ring, tube) = match state.system.objects[i].get_boundary() {
+                        Boundary::Torus { ring_radius, tube_radius } => (ring_radius, tube_radius),
+                        b => {
+                            return Err(format!(
+                                "obj{i} is not a torus (boundary = {b:?}); NEW TORUS creates one"
+                            ))
+                        }
+                    };
+                    /* inner/outer update the derived pair holding the
+                     * other one fixed: ring = (inner+outer)/2,
+                     * tube = (outer-inner)/2 — order-independent when
+                     * both are given in a NEW initializer list */
+                    let (inner, outer) = (ring - tube, ring + tube);
+                    let (new_inner, new_outer) = match path.field.as_str() {
+                        "ring_radius" => (n - tube, n + tube),
+                        "tube_radius" => (ring - n, ring + n),
+                        "inner_radius" => (n, outer),
+                        _ => (inner, n),
+                    };
+                    if new_outer <= new_inner || new_inner < 0.0 {
+                        return Err(format!(
+                            "torus needs 0 <= inner < outer (got inner = {new_inner}, \
+                             outer = {new_outer})"
+                        ));
+                    }
+                    state.system.objects[i].set_boundary(Boundary::Torus {
+                        ring_radius: 0.5 * (new_inner + new_outer),
+                        tube_radius: 0.5 * (new_outer - new_inner),
+                    });
+                    state.system.objects[i].recompute_inertia_from_boundary();
+                }
+                "height" | "half_height" => {
+                    let n = num(value)?;
+                    if !(n.is_finite() && n > 0.0) {
+                        return Err(format!("{} must be a finite number > 0, got {n}", path.field));
+                    }
+                    let radius = match state.system.objects[i].get_boundary() {
+                        Boundary::Cylinder { radius, .. } => radius,
+                        b => {
+                            return Err(format!(
+                                "obj{i} is not a cylinder (boundary = {b:?}); NEW CYLINDER \
+                                 creates one"
+                            ))
+                        }
+                    };
+                    let half_height = if path.field == "height" { 0.5 * n } else { n };
+                    state.system.objects[i]
+                        .set_boundary(Boundary::Cylinder { radius, half_height });
+                    state.system.objects[i].recompute_inertia_from_boundary();
+                }
+                "force" => {
+                    let v = as_vec3(value)?;
+                    state.system.external_forces[i] = v;
+                }
+                "torque" => {
+                    let v = as_vec3(value)?;
+                    state.system.external_torques[i] = v;
+                }
+                "restitution" => {
+                    let n = num(value)?;
+                    if !(n.is_finite() && (0.0..=1.0).contains(&n)) {
+                        return Err(format!(
+                            "restitution must be between 0 (plastic) and 1 (elastic), got {n}"
+                        ));
+                    }
+                    state.system.objects[i].set_restitution(n);
+                }
+                other => {
+                    return Err(format!(
+                        "object field `{other}` is not writable (or unknown) — see HELP"
+                    ))
+                }
+            }
+        }
+        PathRoot::Contact(k) => {
+            return Err(format!(
+                "contact{k} fields are read-only — contacts are the record of what the \
+                 solver already resolved"
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Convenience: lex + parse + execute one command line.
+pub fn execute_line(line: &str, state: &mut SimState) -> Result<Value, String> {
+    let prog = crate::parser::compile_line(line)?;
+    execute(&prog, state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_set_get_roundtrip() {
+        let mut st = SimState::default();
+        let v = execute_line(
+            "new sphere { mass = 2, radius = 0.5, charge = -1.5, position = [0, 10, 0], velocity = [1, 0, -0.5] }",
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(v, Value::Str("obj0".to_string()));
+        assert_eq!(execute_line("get obj0.mass", &mut st).unwrap(), Value::Num(2.0));
+        /* velocity init deferred after mass: momentum = m v */
+        assert_eq!(
+            execute_line("get obj0.momentum", &mut st).unwrap(),
+            Value::Vec3(Vec3::new(2.0, 0.0, -1.0))
+        );
+        /* inertia recomputed from shape: 0.4 * 2 * 0.25 = 0.2 */
+        match execute_line("get obj0.inertia_tensor", &mut st).unwrap() {
+            Value::Mat3(m) => assert!((m.0[0][0] - 0.2).abs() < 1e-15),
+            v => panic!("expected mat3, got {v}"),
+        }
+        execute_line("set obj0.position.y = 42", &mut st).unwrap();
+        assert_eq!(execute_line("get obj0.position.y", &mut st).unwrap(), Value::Num(42.0));
+    }
+
+    #[test]
+    fn expressions_and_builtins() {
+        let mut st = SimState::default();
+        assert_eq!(execute_line("1 + 2 * 3", &mut st).unwrap(), Value::Num(7.0));
+        assert_eq!(
+            execute_line("cross([1,0,0], [0,1,0])", &mut st).unwrap(),
+            Value::Vec3(Vec3::new(0.0, 0.0, 1.0))
+        );
+        assert_eq!(execute_line("dot([1,2,3], [4,5,6])", &mut st).unwrap(), Value::Num(32.0));
+        assert_eq!(execute_line("norm([3,4,0])", &mut st).unwrap(), Value::Num(5.0));
+        let e = execute_line("[1,0,0] * [0,1,0]", &mut st).unwrap_err();
+        assert!(e.contains("dot()/cross()"), "{e}");
+    }
+
+    #[test]
+    fn step_runs_sundials() {
+        let mut st = SimState::default();
+        execute_line("new point { mass = 2, position = [0, 10, 0], velocity = [1, 0, 0] }", &mut st)
+            .unwrap();
+        execute_line("set system.gravity = [0, -9.81, 0]", &mut st).unwrap();
+        execute_line("step 1", &mut st).unwrap();
+        /* y(1) = 10 - 9.81/2 = 5.095 */
+        match execute_line("get obj0.position.y", &mut st).unwrap() {
+            Value::Num(y) => assert!((y - 5.095).abs() < 1e-8, "y = {y}"),
+            v => panic!("expected number, got {v}"),
+        }
+        match execute_line("get system.time", &mut st).unwrap() {
+            Value::Num(t) => assert!((t - 1.0).abs() < 1e-12),
+            v => panic!("expected number, got {v}"),
+        }
+    }
+
+    #[test]
+    fn observables_and_errors() {
+        let mut st = SimState::default();
+        execute_line("new point { mass = 1, position = [1, 0, 0] }", &mut st).unwrap();
+        execute_line("new point { mass = 3, position = [-1, 0, 0] }", &mut st).unwrap();
+        assert_eq!(
+            execute_line("com", &mut st).unwrap(),
+            Value::Vec3(Vec3::new(-0.5, 0.0, 0.0))
+        );
+        assert!(execute_line("get obj7.mass", &mut st).unwrap_err().contains("no object"));
+        assert!(execute_line("get obj0.bogus", &mut st).unwrap_err().contains("unknown object field"));
+    }
+
+    #[test]
+    fn collide_command_and_contact_paths() {
+        let mut st = SimState::default();
+        // Two spheres on a collision course (G = 1 default is irrelevant
+        // at these masses/speeds over the short run).
+        execute_line(
+            "new sphere { mass = 1, radius = 0.5, position = [-2, 0, 0], velocity = [1, 0, 0], restitution = 0.5 }",
+            &mut st,
+        )
+        .unwrap();
+        execute_line(
+            "new sphere { mass = 1, radius = 0.5, position = [2, 0, 0], velocity = [-1, 0, 0] }",
+            &mut st,
+        )
+        .unwrap();
+        // NEW-block restitution round-trips.
+        assert_eq!(execute_line("get obj0.restitution", &mut st).unwrap(), Value::Num(0.5));
+        // COLLIDE status / OFF / ON.
+        match execute_line("collide", &mut st).unwrap() {
+            Value::Str(s) => assert!(s.contains("ON") && s.contains("1 collidable pair"), "{s}"),
+            v => panic!("expected string, got {v}"),
+        }
+        execute_line("collide off", &mut st).unwrap();
+        assert_eq!(execute_line("get system.collide", &mut st).unwrap(), Value::Num(0.0));
+        execute_line("collide on", &mut st).unwrap();
+
+        // Step across the impact; contacts become readable.
+        match execute_line("step 3", &mut st).unwrap() {
+            Value::Str(s) => assert!(s.contains("collision(s)"), "{s}"),
+            v => panic!("expected string, got {v}"),
+        }
+        match execute_line("get system.contacts", &mut st).unwrap() {
+            Value::Num(n) => assert!(n >= 1.0, "contacts = {n}"),
+            v => panic!("expected number, got {v}"),
+        }
+        match execute_line("get contact0.normal", &mut st).unwrap() {
+            Value::Vec3(n) => assert!((n.x - 1.0).abs() < 1e-9, "normal i→j = +x, got {n:?}"),
+            v => panic!("expected vec3, got {v}"),
+        }
+        match execute_line("get contact0.normal.x", &mut st).unwrap() {
+            Value::Num(x) => assert!((x - 1.0).abs() < 1e-9),
+            v => panic!("expected number, got {v}"),
+        }
+        match execute_line("contacts", &mut st).unwrap() {
+            Value::Str(s) => {
+                assert!(s.contains("normal") && s.contains("impulse"), "{s}");
+            }
+            v => panic!("expected string, got {v}"),
+        }
+        // `system.collisions` (the running impulse count) must stay a
+        // distinct path from `system.collide` (the on/off flag) — the
+        // word `collisions` is deliberately not a keyword alias.
+        assert_eq!(execute_line("get system.collisions", &mut st).unwrap(), Value::Num(1.0));
+        execute_line("collide off", &mut st).unwrap();
+        assert_eq!(execute_line("get system.collisions", &mut st).unwrap(), Value::Num(1.0));
+        assert_eq!(execute_line("get system.collide", &mut st).unwrap(), Value::Num(0.0));
+        execute_line("collide on", &mut st).unwrap();
+        // Read-only + range errors.
+        let e = execute_line("set contact0.depth = 1", &mut st).unwrap_err();
+        assert!(e.contains("read-only"), "{e}");
+        let e = execute_line("get contact9.normal", &mut st).unwrap_err();
+        assert!(e.contains("no contact9"), "{e}");
+        // Restitution validation.
+        let e = execute_line("set obj0.restitution = 2", &mut st).unwrap_err();
+        assert!(e.contains("between 0"), "{e}");
+        // Bad path root suggestion mentions contactK.
+        let e = execute_line("get contactx.normal", &mut st).unwrap_err();
+        assert!(e.contains("contactK"), "{e}");
+        // HELP documents the family (lockstep guard).
+        match execute_line("help", &mut st).unwrap() {
+            Value::Str(s) => {
+                assert!(s.contains("COLLIDE") && s.contains("CONTACTS") && s.contains("restitution"));
+            }
+            v => panic!("expected string, got {v}"),
+        }
+    }
+
+    #[test]
+    fn scene_commands_require_a_window() {
+        let mut st = SimState::default();
+        for line in [
+            "scene status",
+            "scene start",
+            "scene translate 1 0",
+            "scene zoom in",
+            "scene events",
+        ] {
+            let e = execute_line(line, &mut st).unwrap_err();
+            assert!(e.contains("SCENE CREATE"), "{line}: {e}");
+        }
+        let e = execute_line("scene close", &mut st).unwrap_err();
+        assert!(e.contains("no scene window"), "{e}");
+    }
+
+    #[test]
+    fn method_switch_and_sprk_gate() {
+        let mut st = SimState::default();
+        execute_line("new sphere { mass = 1, angular_velocity = [0, 2, 0] }", &mut st).unwrap();
+        execute_line("method sprk leapfrog_2_2 0.01", &mut st).unwrap();
+        let e = execute_line("run 1", &mut st).unwrap_err();
+        assert!(e.contains("SPRK"), "{e}");
+        execute_line("method adams", &mut st).unwrap();
+        execute_line("run 1 steps 2", &mut st).unwrap();
+    }
+
+    #[test]
+    fn new_shapes_and_parameter_paths() {
+        let mut st = SimState::default();
+        // Torus by inner/outer radius (order-independent pair): ring
+        // 1.5, tube 0.5 — the manager-demo torus.
+        let v = execute_line("new torus { mass = 1, inner_radius = 1, outer_radius = 2 }", &mut st)
+            .unwrap();
+        assert_eq!(v, Value::Str("obj0".to_string()));
+        assert_eq!(execute_line("get obj0.ring_radius", &mut st).unwrap(), Value::Num(1.5));
+        assert_eq!(execute_line("get obj0.tube_radius", &mut st).unwrap(), Value::Num(0.5));
+        assert_eq!(execute_line("get obj0.inner_radius", &mut st).unwrap(), Value::Num(1.0));
+        assert_eq!(execute_line("get obj0.outer_radius", &mut st).unwrap(), Value::Num(2.0));
+        // Solid-torus inertia about the axis: Iz = m(c² + ¾a²) = 2.4375.
+        match execute_line("get obj0.inertia_tensor", &mut st).unwrap() {
+            Value::Mat3(m) => assert!((m.0[2][2] - 2.4375).abs() < 1e-12),
+            v => panic!("expected mat3, got {v}"),
+        }
+        // Disk m = 2/3, r = 1: Iz = ½ m a² = 1/3.
+        execute_line("new disk { mass = 2/3, radius = 1 }", &mut st).unwrap();
+        match execute_line("get obj1.inertia_tensor", &mut st).unwrap() {
+            Value::Mat3(m) => assert!((m.0[2][2] - 1.0 / 3.0).abs() < 1e-12),
+            v => panic!("expected mat3, got {v}"),
+        }
+        // Cylinder m = 2, r = 1/4, height 1.5 (HEIGHT is the full
+        // height; half_height reads 0.75): Iz = ½ m r² = 0.0625.
+        execute_line("new cylinder { mass = 2, radius = 1/4, height = 1.5 }", &mut st).unwrap();
+        assert_eq!(execute_line("get obj2.half_height", &mut st).unwrap(), Value::Num(0.75));
+        assert_eq!(execute_line("get obj2.height", &mut st).unwrap(), Value::Num(1.5));
+        assert_eq!(execute_line("get obj2.radius", &mut st).unwrap(), Value::Num(0.25));
+        match execute_line("get obj2.inertia_tensor", &mut st).unwrap() {
+            Value::Mat3(m) => assert!((m.0[2][2] - 0.0625).abs() < 1e-12),
+            v => panic!("expected mat3, got {v}"),
+        }
+        // LIST names the shapes; shape params error on the wrong shape.
+        match execute_line("list", &mut st).unwrap() {
+            Value::Str(s) => {
+                assert!(s.contains("torus ring=1.5 tube=0.5"), "{s}");
+                assert!(s.contains("disk r=1"), "{s}");
+                assert!(s.contains("cylinder r=0.25 h=1.5"), "{s}");
+            }
+            v => panic!("expected string, got {v}"),
+        }
+        let e = execute_line("get obj1.ring_radius", &mut st).unwrap_err();
+        assert!(e.contains("not a torus"), "{e}");
+        // HELP documents the whole family.
+        match execute_line("help", &mut st).unwrap() {
+            Value::Str(h) => {
+                assert!(h.contains("TORUS"), "help lists TORUS");
+                assert!(h.contains("BOX <size>"), "help lists BOX");
+                assert!(h.contains("inverse_mass = 0"), "help explains inverse mass");
+            }
+            v => panic!("expected string, got {v}"),
+        }
+    }
+
+    #[test]
+    fn box_family_and_infinite_mass_walls() {
+        let mut st = SimState::default();
+        match execute_line("box", &mut st).unwrap() {
+            Value::Str(s) => assert!(s.contains("none"), "{s}"),
+            v => panic!("expected string, got {v}"),
+        }
+        assert_eq!(execute_line("get system.box", &mut st).unwrap(), Value::Num(0.0));
+
+        // BOX 4: six static walls obj0..obj5, inverse mass 0.
+        match execute_line("box 4", &mut st).unwrap() {
+            Value::Str(s) => {
+                assert!(s.contains("inverse_mass = 0"), "{s}");
+                assert!(s.contains("obj0") && s.contains("obj5"), "{s}");
+            }
+            v => panic!("expected string, got {v}"),
+        }
+        assert_eq!(execute_line("get system.count", &mut st).unwrap(), Value::Num(6.0));
+        assert_eq!(execute_line("get system.box", &mut st).unwrap(), Value::Num(4.0));
+        assert_eq!(execute_line("get obj0.inverse_mass", &mut st).unwrap(), Value::Num(0.0));
+
+        // A ball rattling inside: elastic bounces conserve energy and
+        // the infinitely massive walls never move.
+        execute_line("set system.g_constant = 0", &mut st).unwrap();
+        execute_line("new sphere { mass = 1, radius = 0.5, velocity = [3, 1.7, 0.9] }", &mut st)
+            .unwrap();
+        let e0 = match execute_line("energy", &mut st).unwrap() {
+            Value::Num(e) => e,
+            v => panic!("expected number, got {v}"),
+        };
+        execute_line("run 2 steps 20", &mut st).unwrap();
+        let e1 = match execute_line("energy", &mut st).unwrap() {
+            Value::Num(e) => e,
+            v => panic!("expected number, got {v}"),
+        };
+        assert!((e1 - e0).abs() < 1e-9 * e0.abs(), "elastic box: E {e0} -> {e1}");
+        assert!(st.system.collision_count > 0, "bounces happened");
+        assert_eq!(
+            execute_line("get obj0.momentum", &mut st).unwrap(),
+            Value::Vec3(Vec3::zeros()),
+            "wall momentum stays zero"
+        );
+
+        // BOX OFF removes the walls; the ball renumbers to obj0.
+        match execute_line("box off", &mut st).unwrap() {
+            Value::Str(s) => assert!(s.contains("removed"), "{s}"),
+            v => panic!("expected string, got {v}"),
+        }
+        assert_eq!(execute_line("get system.count", &mut st).unwrap(), Value::Num(1.0));
+        assert_eq!(execute_line("get system.box", &mut st).unwrap(), Value::Num(0.0));
+        assert_eq!(execute_line("get obj0.mass", &mut st).unwrap(), Value::Num(1.0));
+    }
+
+    #[test]
+    fn torus_pair_is_order_independent_and_new_is_transactional() {
+        // The inner/outer pair resolves at FinishNew: both orders work,
+        // including pairs where sequential validation used to fail.
+        for line in [
+            "new torus { inner_radius = 1, outer_radius = 2 }",
+            "new torus { outer_radius = 2, inner_radius = 1 }",
+            "new torus { outer_radius = 0.5, inner_radius = 0.2 }",
+        ] {
+            let mut st = SimState::default();
+            execute_line(line, &mut st).unwrap_or_else(|e| panic!("{line}: {e}"));
+        }
+        let mut st = SimState::default();
+        execute_line("new torus { outer_radius = 0.5, inner_radius = 0.2 }", &mut st).unwrap();
+        assert_eq!(execute_line("get obj0.ring_radius", &mut st).unwrap(), Value::Num(0.35));
+        assert_eq!(execute_line("get obj0.tube_radius", &mut st).unwrap(), Value::Num(0.15));
+
+        // A genuinely invalid pair fails once, against the FINAL values —
+        // and the failed NEW leaves NO ghost object behind.
+        let e = execute_line("new torus { inner_radius = 2, outer_radius = 1 }", &mut st)
+            .unwrap_err();
+        assert!(e.contains("inner < outer"), "{e}");
+        assert_eq!(execute_line("get system.count", &mut st).unwrap(), Value::Num(1.0));
+        let e2 = execute_line("new sphere { radius = -1 }", &mut st).unwrap_err();
+        assert!(e2.contains("finite number > 0"), "{e2}");
+        assert_eq!(execute_line("get system.count", &mut st).unwrap(), Value::Num(1.0));
+
+        // Horn torus: inner_radius = 0 is a valid body, on NEW and SET.
+        execute_line("new torus { inner_radius = 0, outer_radius = 1 }", &mut st).unwrap();
+        assert_eq!(execute_line("get obj1.ring_radius", &mut st).unwrap(), Value::Num(0.5));
+        execute_line("set obj1.inner_radius = 0", &mut st).unwrap();
+
+        // SET radius on a torus is refused (it has two radii), instead
+        // of silently turning it into a sphere.
+        let e3 = execute_line("set obj1.radius = 1", &mut st).unwrap_err();
+        assert!(e3.contains("ring_radius"), "{e3}");
+        match execute_line("get obj1.shape", &mut st).unwrap() {
+            Value::Str(s) => assert!(s.contains("Torus"), "still a torus: {s}"),
+            v => panic!("expected string, got {v}"),
+        }
+    }
+
+    #[test]
+    fn box_recreate_after_wall_deletion_leaks_nothing() {
+        let mut st = SimState::default();
+        execute_line("box 4", &mut st).unwrap();
+        execute_line("del 0", &mut st).unwrap(); // dissolves the box
+        match execute_line("box", &mut st).unwrap() {
+            Value::Str(s) => assert!(s.contains("dissolved"), "{s}"),
+            v => panic!("expected string, got {v}"),
+        }
+        assert_eq!(execute_line("get system.box", &mut st).unwrap(), Value::Num(0.0));
+        // Recreating removes the five surviving tracked slabs first.
+        execute_line("box 10", &mut st).unwrap();
+        assert_eq!(execute_line("get system.count", &mut st).unwrap(), Value::Num(6.0));
+        assert_eq!(execute_line("get system.box", &mut st).unwrap(), Value::Num(10.0));
+        execute_line("box off", &mut st).unwrap();
+        assert_eq!(execute_line("get system.count", &mut st).unwrap(), Value::Num(0.0));
+    }
+}

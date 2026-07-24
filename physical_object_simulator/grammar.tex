@@ -1,0 +1,1186 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2.6cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{array,longtable}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{parskip}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framerule=0.2pt,
+  xleftmargin=0.6em,
+  aboveskip=0.7em,
+  belowskip=0.7em,
+  literate={—}{{---}}1 {°}{{\ensuremath{^\circ}}}1 {≈}{{\ensuremath{\approx}}}1
+}
+
+\newcommand{\kw}[1]{\texttt{\uppercase{#1}}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{The \code{posim} Command Language\\[2pt]
+       \large Complete Grammar \& Notebook Guide}
+\author{physical\_object\_simulator}
+\date{July 21, 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{What is this document about?}
+
+\textbf{posim} is the front end of the \code{physical\_object\_simulator}.
+Instead of writing Rust code to create objects and run physics, you type
+short \emph{commands} --- one per line --- into a \emph{notebook}. Each
+command line is:
+\begin{enumerate}
+\item chopped into \emph{tokens} by a \emph{lexer} (like the classic Unix
+      tool \code{lex}/\code{flex});
+\item checked against a \emph{grammar} and compiled into a small program
+      by a \emph{parser} (like \code{yacc}/\code{bison});
+\item executed by a \emph{stack machine} --- a tiny computer whose only
+      memory is a stack of values --- which reads and writes the simulator
+      exclusively through its public get/set functions.
+\end{enumerate}
+You never see steps 1--3; you type a line, press Enter (or shift-enter in
+JupyterLab), and see the result. This document specifies exactly what you
+may type.
+
+There are three ways to talk to the same language:
+
+\begin{center}
+\begin{tabular}{lll}
+\textbf{mode} & \textbf{start with} & \textbf{who it is for}\\\hline
+notebook REPL & \code{cargo run} (or \code{posim}) & humans at a terminal\\
+script        & \code{posim --script file}         & batch runs, reproducibility\\
+machine       & \code{posim --machine}             & programs, and the JupyterLab kernel\\
+\end{tabular}
+\end{center}
+
+\section{Lexical structure (what the lexer sees)}
+
+A command line is a sequence of \emph{tokens} separated by optional
+whitespace. Everything from a \code{\#} to the end of the line is a
+\emph{comment} and is ignored.
+
+\subsection{Token kinds}
+
+\begin{center}
+\begin{tabular}{lp{4.2cm}p{6.6cm}}
+\textbf{token} & \textbf{examples} & \textbf{rules}\\\hline
+keyword & \code{NEW}, \code{set}, \code{Run} & case-insensitive; list in \S\ref{sec:keywords}\\
+identifier & \code{obj0}, \code{position} & a letter or \code{\_}, then letters, digits, \code{\_}\\
+number & \code{2}, \code{0.5}, \code{.5}, \code{1e-3} & 64-bit float; scientific notation allowed; a leading \code{-} is \emph{not} part of the number --- it is the negation operator\\
+punctuation & \code{[ ] \{ \} ( ) , . =} & brackets build vectors, braces enclose initializers, \code{.} builds dotted paths\\
+operators & \code{+ - * /} & ordinary arithmetic\\
+\end{tabular}
+\end{center}
+
+If the lexer meets a character it does not know (say \code{@}), it stops
+with an error naming the \emph{column} (character position, starting at~1):
+\begin{lstlisting}
+Err[1]: lexical error at column 10: unexpected character `@`
+\end{lstlisting}
+
+\subsection{Keywords}\label{sec:keywords}
+
+\code{NEW SET GET DEL DELETE LIST STEP RUN STEPS METHOD ADAMS BDF SPRK
+ENERGY COM MOMENTUM ANGMOM LAPLACE HELP POINT SPHERE CUBOID TORUS DISK
+CYLINDER BOX RESET}
+
+and, for the graphical scene window (documented in \code{scene\_info.pdf};
+Examples 11--12 show live sessions):
+
+\code{SCENE CREATE CLOSE DESTROY TRANSLATE ROTATE ZOOM IN OUT HIDE SHOW
+REFRESH REDRAW START STOP PAUSE REVERSE SET\_TIME\_STEP SETTIMESTEP
+STATUS EVENTS ALL}
+
+and, for rigid-body collisions (\S\ref{sec:collide}):
+
+\code{COLLIDE CONTACTS ON OFF}
+
+(\kw{destroy} is an alias for \kw{close}; \kw{settimestep} for
+\kw{set\_time\_step}; the spellings \kw{cube} and \kw{disc} are lexer
+aliases for \kw{cuboid} and \kw{disk}. \code{collisions} is
+deliberately \textbf{not} a keyword so the field path
+\code{system.collisions} keeps its own spelling.)
+
+Keywords are reserved \emph{at the start of paths}, but \textbf{field
+names may reuse keyword spellings} --- \code{obj0.momentum} and
+\code{system.method} work even though \kw{momentum} and \kw{method} are
+keywords, because after a dot (or inside \code{NEW \{ ... \}}) the parser
+accepts either an identifier or a keyword as a field name. The same
+holds for the scene keywords: making \kw{show} or \kw{in} reserved does
+not stop you from ever using those spellings as field names after a
+\code{.}.
+
+\subsection{Magics}
+
+A line whose first character is \code{\%} is a \emph{notebook magic}
+(\S\ref{sec:magics}) and is handled by the notebook itself; it never
+reaches the lexer.
+
+\section{The grammar (what the parser accepts)}
+
+The grammar in EBNF (Extended Backus--Naur Form: \code{[x]} means
+optional, \code{\{x\}} means zero-or-more repetitions, \code{|} separates
+alternatives):
+
+\begin{lstlisting}
+line     := command | magic ;
+
+command  := "NEW" shape [ "{" init { "," init } "}" ]
+          | "SET" path "=" expr
+          | "GET" path
+          | "DEL" NUMBER
+          | "LIST"
+          | "STEP" expr                        (* advance time by dt      *)
+          | "RUN" expr [ "STEPS" NUMBER ]      (* advance by t, n outputs *)
+          | "METHOD" ( "ADAMS" | "BDF" | "SPRK" IDENT [ NUMBER ] )
+          | "ENERGY" | "COM" | "MOMENTUM" | "ANGMOM"
+          | "LAPLACE" NUMBER
+          | "RESET"
+          | "HELP"
+          | "SCENE" scenecmd                   (* graphical scene window  *)
+          | "COLLIDE" [ "ON" | "OFF" ]         (* bare: report status     *)
+          | "CONTACTS"                         (* contacts of last run    *)
+          | "BOX" [ "OFF" | expr ]             (* rigid bounding box:
+                                                  expr = inner side
+                                                  length; bare = status;
+                                                  OFF removes it          *)
+          | expr ;                             (* bare expression         *)
+
+scenecmd := "CREATE" [ NUMBER ]                (* open window [TCP port]  *)
+          | "CLOSE"                            (* alias: DESTROY          *)
+          | "TRANSLATE" term term [ term ]     (* camera dx dy [dz]       *)
+          | "ROTATE" term term                 (* camera dyaw dpitch, deg *)
+          | "ZOOM" ( "IN" | "OUT" | term )     (* factor > 1 zooms in     *)
+          | "HIDE" [ NUMBER | "ALL" ]          (* default: ALL            *)
+          | "SHOW" [ NUMBER | "ALL" ]
+          | "REFRESH"                          (* re-sync from notebook   *)
+          | "REDRAW"                           (* re-send whole scene     *)
+          | "START" | "STOP" | "PAUSE" | "REVERSE"
+          | "SET_TIME_STEP" term
+          | "STATUS" | "EVENTS" ;
+
+shape    := "POINT" | "SPHERE" | "CUBOID" | "TORUS" | "DISK" | "CYLINDER" ;
+init     := FIELD "=" expr ;
+
+path     := root "." FIELD [ "." COMPONENT ] ;
+root     := "objN"           (* N = object index, e.g. obj0, obj12 *)
+          | "contactK"       (* K = contact index of the last run  *)
+          | "system" | "sys" ;
+COMPONENT:= "x" | "y" | "z" | "w" ;
+
+expr     := term  { ("+" | "-") term  } ;
+term     := unary { ("*" | "/") unary } ;
+unary    := "-" unary | atom ;
+atom     := NUMBER
+          | "[" expr { "," expr } "]"          (* vector/matrix literal  *)
+          | "(" expr ")"
+          | FUNC "(" [ expr { "," expr } ] ")" (* builtin function call  *)
+          | path
+          | "pi" | "tau" ;
+FUNC     := "dot" | "cross" | "norm" | "normalize"
+          | "sqrt" | "abs" | "sin" | "cos" | "exp" | "log" ;
+\end{lstlisting}
+
+Operator precedence is the usual one: \code{*} and \code{/} bind tighter
+than \code{+} and \code{-}; unary minus binds tightest; parentheses
+override everything.
+
+\textbf{One subtlety worth learning early:} \kw{get} takes \emph{only a
+path}. To do arithmetic with a field, use a \emph{bare expression}:
+\begin{lstlisting}
+get obj0.position.x - 5        # ERROR -- GET wants just a path
+obj0.position.x - 5            # OK -- bare expression
+\end{lstlisting}
+
+\textbf{A second subtlety --- \kw{scene} arguments are \emph{terms},
+not full expressions.} The scene commands take several numbers in a row
+with no commas between them. If those numbers were parsed as full
+expressions, \code{scene rotate 15 -5} would be read as \emph{one}
+argument $15-5=10$ (whitespace never matters to the lexer) and the
+command would then be missing its second argument. So scene arguments
+stop one level lower in the grammar, at \code{term}: \code{-5} is
+negative five, \code{2*2} and \code{1/3} still work, but a sum or
+difference must be parenthesized:
+
+\begin{lstlisting}
+scene rotate 15 -5             # yaw +15 deg, pitch -5 deg (two arguments)
+scene zoom (1 + 0.5)           # a sum needs parentheses
+scene translate 2*2 0 1/2      # * and / are fine unparenthesized
+\end{lstlisting}
+
+\section{The type system (what values exist)}
+
+Every expression evaluates to one of these \emph{values}:
+
+\begin{center}
+\begin{tabular}{llp{7.2cm}}
+\textbf{type} & \textbf{written as} & \textbf{notes}\\\hline
+number & \code{2}, \code{-0.5}, \code{1e-3} & 64-bit float\\
+vec3 & \code{[1, 2, 3]} & exactly 3 numeric entries\\
+quaternion & \code{[w, x, y, z]} & exactly 4 numeric entries, \textbf{w first}; assigned to \code{orientation} it is renormalized to unit length\\
+mat3 & \code{[[a,b,c],[d,e,f],[g,h,i]]} & 3 rows of 3 numbers\\
+string & (produced, not typed) & results like \code{obj0} or run summaries\\
+\end{tabular}
+\end{center}
+
+Bracket literals are \emph{shape-directed}: 3 numbers make a vec3,
+4 numbers make a quaternion, 3 vec3s make a mat3.
+
+Arithmetic is \emph{type-checked}:
+\begin{center}
+\begin{tabular}{lp{9.5cm}}
+\textbf{operation} & \textbf{allowed}\\\hline
+\code{+}, \code{-} & number$\pm$number, vec3$\pm$vec3, quat$\pm$quat\\
+\code{*} & number$\cdot$number, number$\cdot$vec3, number$\cdot$quat, number$\cdot$mat3, mat3$\cdot$vec3, mat3$\cdot$mat3, quat$\cdot$quat (Hamilton product)\\
+\code{/} & number/number, vec3/number\\
+vec3\,\code{*}\,vec3 & \textbf{forbidden} --- the error tells you to use \code{dot()} or \code{cross()}\\
+\end{tabular}
+\end{center}
+
+Builtins: \code{dot(a,b)}, \code{cross(a,b)}, \code{norm(v)} (length;
+also quaternions and numbers), \code{normalize(v)}, and scalar
+\code{sqrt abs sin cos exp log}. Constants: \code{pi}, \code{tau}
+($=2\pi$).
+
+\section{Command semantics}
+
+\subsection{\kw{new} --- create an object}
+
+\begin{lstlisting}
+NEW POINT    { field = expr, ... }
+NEW SPHERE   { field = expr, ... }
+NEW CUBOID   { field = expr, ... }        (alias: NEW CUBE)
+NEW TORUS    { field = expr, ... }
+NEW DISK     { field = expr, ... }        (alias: NEW DISC)
+NEW CYLINDER { field = expr, ... }
+\end{lstlisting}
+
+Creates one \emph{physical object} and prints its handle (\code{obj0},
+\code{obj1}, \ldots, numbered by position). Defaults: mass 1, at the
+origin, at rest, no charge; sphere radius 1; cuboid half-extents
+\code{[1,1,1]}; torus \code{ring\_radius} 1, \code{tube\_radius} 0.25;
+disk radius 1; cylinder radius 0.5, \code{half\_height} 1.
+
+Initializer fields: \code{mass, charge, position, velocity, momentum,
+orientation, angular\_velocity, angular\_momentum, radius} (spheres,
+disks, cylinders), \code{half\_extents} (cuboids), \code{ring\_radius,
+tube\_radius} (tori --- or the \code{inner\_radius} +
+\code{outer\_radius} pair, see below), \code{height, half\_height}
+(cylinders; \kw{height} is the full height $= 2\cdot$\code{half\_height}),
+\code{inertia\_tensor, inverse\_inertia\_tensor,
+magnetic\_moment\_tensor, force, torque, id, inverse\_mass}.
+
+A torus can be sized two ways: directly (\code{ring\_radius} $c$ = the
+radius of the circle traced by the tube's center, \code{tube\_radius}
+$a$ = the tube's own radius) or by the \textbf{\code{inner\_radius} +
+\code{outer\_radius} pair} (the hole's radius and the outermost
+radius: $\mathrm{inner} = c - a$, $\mathrm{outer} = c + a$). Inside a
+\kw{new} initializer list the torus geometry is \textbf{deferred}: the
+four radius fields are collected and resolved \emph{once}, at the end
+of the list --- \code{ring\_radius}/\code{tube\_radius} are applied
+first, then \code{inner\_radius}/\code{outer\_radius} override the
+derived pair --- and the result is validated once, against the
+\emph{final} values (a bad pair fails with \code{torus needs 0 <=
+inner < outer (got inner = 2, outer = 1)}). Giving both members of the
+pair is therefore \textbf{genuinely order-independent}:
+\code{\{ inner\_radius = 1, outer\_radius = 2 \}} yields ring 1.5,
+tube 0.5 whichever comes first, and a pair that shrinks the default
+torus --- \code{\{ outer\_radius = 0.5, inner\_radius = 0.2 \}} ---
+works in either order too (checking each write against the
+half-updated default would have refused one of the two orders).
+\code{inner\_radius = 0} is legal --- that is the \textbf{horn torus},
+whose tube touches the axis --- on \kw{new} and on \kw{set} alike.
+
+Four guarantees make initializers forgiving:
+\begin{enumerate}
+\item \textbf{Order does not matter for velocities.} \code{velocity} and
+      \code{angular\_velocity} are applied \emph{after} mass and inertia
+      are final, so \code{\{ velocity = [1,0,0], mass = 2 \}} still
+      yields momentum \code{[2,0,0]}.
+\item \textbf{Inertia is computed for you.} For every extended shape
+      the inertia tensor is recomputed from the final mass and shape
+      (solid sphere $\tfrac{2}{5}mr^2$; cuboid $\tfrac{m}{3}(h_y^2+h_z^2)$
+      etc.; torus $I_z = m(c^2+\tfrac34 a^2)$,
+      $I_{xy} = m(\tfrac12 c^2+\tfrac58 a^2)$; disk
+      $I_z = \tfrac12 ma^2$, $I_{xy} = \tfrac14 ma^2$; cylinder
+      $I_z = \tfrac12 mr^2$, $I_{xy} = m(3r^2+4h^2)/12$ with $h$ the
+      half-height) --- \emph{unless} you supplied
+      \code{inertia\_tensor} yourself, in which case yours is kept.
+\item \textbf{Coupled fields stay consistent} (see \kw{set} below).
+\item \textbf{\kw{new} is transactional.} If any initializer --- or
+      the final geometry validation --- fails, the half-built object
+      is removed before the error is reported: a failing \kw{new}
+      never leaves a ghost behind, and \code{system.count} and the
+      \code{objN} numbering are exactly what they were before the
+      command.
+\end{enumerate}
+
+\subsection{\kw{set} / \kw{get} --- write and read any field}
+
+A \emph{path} is \code{objN.field} or \code{system.field}, optionally
+followed by a component \code{.x .y .z} (vectors) or
+\code{.w .x .y .z} (quaternions). Component writes are safe
+read-modify-write operations through the full field's get/set pair.
+
+\textbf{Object fields} (R = readable, W = writable):
+
+\begin{longtable}{lllp{6.4cm}}
+\textbf{field} & \textbf{type} & \textbf{R/W} & \textbf{meaning}\\\hline
+\code{id} & number & RW & user label (no effect on physics)\\
+\code{mass} & number & RW & writing also updates \code{inverse\_mass} ($m\le 0 \Rightarrow 1/m := 0$)\\
+\code{inverse\_mass} & number & RW & writing back-computes \code{mass}; $0$ makes the body \textbf{static}\\
+\code{charge} & number & RW & Coulombs\\
+\code{position}, \code{pos} & vec3 & RW & world position\\
+\code{velocity}, \code{vel} & vec3 & RW & \emph{derived}: reads $p/m$, writes $p := m v$\\
+\code{momentum} & vec3 & RW & canonical stored linear state\\
+\code{orientation} & quat & RW & renormalized on write\\
+\code{angular\_velocity} & vec3 & RW & derived: $\omega = R\,I^{-1}R^{\mathsf T}L$; writes $L := R\,I\,R^{\mathsf T}\omega$\\
+\code{angular\_momentum} & vec3 & RW & canonical stored angular state (spin)\\
+\code{inertia\_tensor} & mat3 & RW & body frame; write updates the inverse (singular $\to$ zero inverse = cannot rotate)\\
+\code{inverse\_inertia\_tensor} & mat3 & RW & write back-computes the tensor\\
+\code{magnetic\_moment\_tensor} & mat3 & RW & torque $\tau = (R M R^{\mathsf T})B$\\
+\code{radius} & number & RW & spheres, disks, cylinders; write recomputes inertia and \textbf{keeps the shape family} (a disk stays a disk, a cylinder keeps its height); a torus is \textbf{refused} --- \code{obj6 is a torus \textemdash{} set ring\_radius/tube\_radius or inner\_radius/outer\_radius instead of radius} --- rather than silently becoming a sphere\\
+\code{half\_extents} & vec3 & RW & cuboids only; write recomputes inertia\\
+\code{ring\_radius}, \code{tube\_radius} & number & RW & tori only; write recomputes inertia\\
+\code{inner\_radius}, \code{outer\_radius} & number & RW & tori only, derived ($\mathrm{inner} = c-a$, $\mathrm{outer} = c+a$); writing one holds the other fixed; \code{inner\_radius} accepts $\ge 0$ (0 = the horn torus; the other radii must be $> 0$)\\
+\code{height}, \code{half\_height} & number & RW & cylinders only; \code{height} is the full height ($= 2\cdot$\code{half\_height}); write recomputes inertia\\
+\code{boundary}, \code{shape} & string & R & description of the shape\\
+\code{kinetic\_energy}, \code{energy} & number & R & $\tfrac12 m|v|^2 + \tfrac12\,\omega\!\cdot\!L$\\
+\code{force} & vec3 & RW & constant external force during \kw{step}/\kw{run}\\
+\code{torque} & vec3 & RW & constant external torque\\
+\code{restitution} & number & RW & collision bounciness $e \in [0,1]$ (default 1 = elastic; a pair uses $\min(e_i, e_j)$)\\
+\end{longtable}
+
+\textbf{System fields}:
+
+\begin{center}
+\begin{tabular}{lllp{6.2cm}}
+\textbf{field} & \textbf{type} & \textbf{R/W} & \textbf{meaning}\\\hline
+\code{g\_constant}, \code{g} & number & RW & Newton's $G$ (default 1)\\
+\code{softening} & number & RW & Plummer length $\varepsilon$ (default $10^{-6}$); forces use $(r^2+\varepsilon^2)^{3/2}$\\
+\code{uniform\_gravity}, \code{gravity} & vec3 & RW & constant acceleration field\\
+\code{e\_field} & vec3 & RW & uniform $E$; force $qE$\\
+\code{b\_field} & vec3 & RW & uniform $B$; force $q\,v\times B$, torque $(RMR^{\mathsf T})B$\\
+\code{rtol}, \code{atol} & number & RW & CVODE tolerances ($10^{-10}$, $10^{-12}$)\\
+\code{time}, \code{t} & number & RW & current simulation time\\
+\code{method} & string & R & current integrator\\
+\code{count}, \code{n} & number & R & number of objects\\
+\code{collide} & number & R & 1 when collision detection is on (switch with \kw{collide on/off})\\
+\code{contacts} & number & R & contacts recorded by the last \kw{step}/\kw{run}\\
+\code{collisions} & number & R & running total of resolved impulses\\
+\code{restitution\_threshold} & number & RW & approach speeds below this bounce with $e=0$ (default $10^{-3}$)\\
+\code{contact\_slop} & number & RW & tolerated overlap before positional projection (default $10^{-9}$)\\
+\code{box} & number & R & inner side length of the rigid bounding box (\S\ref{sec:box}); 0 = none. Create/remove with \kw{box}\\
+\end{tabular}
+\end{center}
+
+\subsection{\kw{step} and \kw{run} --- integrate (always via SUNDIALS)}
+
+\code{STEP dt} advances time by \code{dt}. \code{RUN t STEPS n} advances
+by \code{t}, stopping at \code{n} evenly spaced output points (default
+10). Both accept full expressions (\code{run 2 * pi steps 8} is legal).
+The reply summarizes the run; \code{|dE/E|} is the relative change in
+total energy --- your built-in sanity check. \textbf{All integration is
+performed by the pure-Rust SUNDIALS solvers}; there is no hand-rolled
+stepper.
+
+\subsection{\kw{method} --- choose the integrator}
+
+\begin{lstlisting}
+METHOD ADAMS               (default; CVODE Adams-Moulton, adaptive)
+METHOD BDF                 (CVODE BDF -- stiff problems, fast gyration)
+METHOD SPRK <table> [dt]   (ARKODE symplectic, fixed step; default dt 0.01)
+\end{lstlisting}
+
+Table names may be abbreviated: \code{leapfrog\_2\_2} becomes
+\code{ARKODE\_SPRK\_LEAPFROG\_2\_2}. Useful tables: \code{EULER\_1\_1},
+\code{LEAPFROG\_2\_2} ($\equiv$ classic velocity Verlet),
+\code{MCLACHLAN\_2\_2/3\_3/4\_4/5\_6}, \code{RUTH\_3\_3},
+\code{YOSHIDA\_6\_8}.
+
+SPRK requires a \emph{separable} system: point-like translation only.
+If anything velocity-dependent or rotational is active (a
+\code{b\_field}, a magnetic tensor, an external torque, a spinning
+rigid body), \kw{run} refuses with an error \emph{naming the offending
+feature}.
+
+\subsection{Observables, bookkeeping, help}
+
+\begin{center}
+\begin{tabular}{lp{10cm}}
+\textbf{command} & \textbf{prints}\\\hline
+\kw{energy} & kinetic + softened pairwise potential + uniform-field potentials\\
+\kw{com} & system center of mass\\
+\kw{momentum} & total linear momentum\\
+\kw{angmom} & total angular momentum about the origin (orbital + spin)\\
+\kw{laplace} $n$ & Laplace--Runge--Lenz vector of object $n$ about the center of mass, $k = G\,M_{\mathrm{total}}$\\
+\kw{list} & one line per object\\
+\kw{del} $n$ & removes object $n$ (\textbf{later objects renumber!})\\
+\kw{reset} & wipes everything\\
+\kw{help} & the quick-reference card\\
+\end{tabular}
+\end{center}
+
+\subsection{\kw{collide} and \kw{contacts} --- rigid-body collisions}
+\label{sec:collide}
+
+\begin{lstlisting}
+COLLIDE            (report: on/off, collidable pairs, impulses so far)
+COLLIDE ON         (default - collisions are detected in EVERY scene)
+COLLIDE OFF        (pure point-mass/gravity studies)
+CONTACTS           (list every contact of the last STEP/RUN)
+\end{lstlisting}
+
+When collisions are on (the default) and the system contains at least
+one collidable pair (spheres, cuboids, or a point against either ---
+two points cannot collide), \kw{step} and \kw{run} detect impacts
+\textbf{during} the time step by SUNDIALS \emph{event rootfinding}: the
+integrator itself lands on the instant where a pair's signed separation
+crosses zero, interpolated to solver precision. At that instant an
+impulse acts along the \textbf{contact normal} --- the line of the
+action--reaction force pair --- and integration continues. Nothing
+tunnels, and the reply reports what happened.
+
+Every contact of the last \kw{step}/\kw{run} is recorded and exposed to
+the rest of the simulation through read-only \code{contactK} paths:
+
+\begin{center}\small
+\begin{tabular}{llp{8.0cm}}
+\textbf{field} & \textbf{type} & \textbf{meaning}\\\hline
+\code{contactK.i}, \code{contactK.j} & number & the colliding pair (indices, $i < j$)\\
+\code{contactK.t} & number & the event time (the root the solver landed on)\\
+\code{contactK.point} & vec3 & world-space contact point\\
+\code{contactK.normal} & vec3 & \textbf{unit normal, from \code{obji} toward \code{objj}} --- the action--reaction line; \code{objj} receives $+J\hat n$, \code{obji} receives $-J\hat n$\\
+\code{contactK.depth} & number & penetration depth at the event ($\approx 0$)\\
+\code{contactK.rel\_vel\_n} & number & approach speed along the normal (negative = approaching)\\
+\code{contactK.impulse} & number & scalar impulse magnitude $J$\\
+\end{tabular}
+\end{center}
+
+Response physics (full derivation in \code{collision\_detection.pdf}):
+per-object \code{restitution} $e \in [0,1]$ (1 = elastic default, 0 =
+perfectly plastic), pair-combined as $\min(e_i, e_j)$; impulse
+$J = -(1+e)\,(\mathbf v_{\mathrm{rel}}\cdot\hat n)\,/\,(\hat n^{\!\top}
+K \hat n)$ with the effective-mass matrix $K$ including the angular
+terms, applied through the canonical momentum/angular-momentum setters;
+static bodies (\code{inverse\_mass} $= 0$) are immovable walls;
+approach speeds below \code{system.restitution\_threshold} settle
+without bounce; leftover overlap beyond \code{system.contact\_slop} is
+projected out. \kw{scene} windows draw each contact normal as an arrow
+at the contact point (\textbf{Contacts} toolbar button or the \code{C}
+key).
+
+\subsection{\kw{box} --- the rigid bounding box}
+\label{sec:box}
+
+\begin{lstlisting}
+BOX <size>         (create: six static walls enclosing an inner
+                    size x size x size cube centered on the origin)
+BOX OFF            (remove the box - its six walls are deleted)
+BOX                (bare: report status)
+\end{lstlisting}
+
+\kw{box} \code{<size>} builds a closed rigid room out of \textbf{six
+ordinary cuboid objects} --- wall slabs behind the planes
+$x = \pm\,\mathrm{size}/2$, $y = \pm\,\mathrm{size}/2$,
+$z = \pm\,\mathrm{size}/2$ (half-thickness $\mathrm{size}/4$, centers
+at $\pm 3\cdot\mathrm{size}/4$, cross-sections wide enough to cover
+the corners) --- and prints their handles:
+
+\begin{lstlisting}
+In[2]:= box 4
+Out[2]= box: inner size 4 x 4 x 4 — six static walls obj0, obj1, obj2, obj3, obj4, obj5 with inverse_mass = 0 (infinitely massive); objects collide elastically off the inside faces
+\end{lstlisting}
+
+\textbf{Infinite mass is exact, not approximate.} The equations of
+motion never use the mass itself --- only the \emph{inverse} mass:
+velocity is $v = p\,m^{-1}$, and the collision impulse divides by
+$\hat n^{\!\top}K\hat n = m_i^{-1} + m_j^{-1} + (\text{angular terms})$
+(\S\ref{sec:collide}). Each wall is created with
+\code{inverse\_mass} $= 0$ and a zero inverse inertia tensor, so it
+contributes exactly 0 to every impulse denominator and receives no
+state writes: bodies bounce off the inside faces elastically while the
+walls stay \textbf{bit-identically at rest}. One measurable
+consequence: system \textbf{momentum is not conserved} inside a box
+--- the infinitely massive walls absorb it without moving
+(Example 13). \kw{list} tags every wall
+\code{[wall: static, inverse\_mass=0]} (and shows \code{mass=0} ---
+the canonical stored quantity for a static body is the inverse).
+
+Bookkeeping:
+\begin{itemize}
+\item \code{GET system.box} reads the inner side length; 0 means no
+      box. The path is read-only --- the box is created and removed by
+      the command.
+\item A second \kw{box} \code{<size>} \textbf{replaces} the existing
+      box: the old walls are removed first and the reply notes
+      \code{(replacing the previous box)}.
+\item The walls are ordinary objects with ordinary indices: \kw{del}
+      on a wall deletes it like any other object \textbf{and dissolves
+      the box} --- \code{system.box} drops to 0 (five walls no longer
+      enclose anything) --- but the surviving slabs \textbf{stay
+      tracked}: \kw{list} keeps their
+      \code{[wall: static, inverse\_mass=0]} tag, and bare \kw{box}
+      reports \code{box: dissolved (a wall was deleted; 5 tracked
+      slab(s) remain \textemdash{} BOX <size> replaces them, BOX OFF
+      removes them)}. The next \kw{box} \code{<size>} removes the
+      survivors \emph{before} building the new box (the reply notes
+      \code{(replacing the previous box)}) and \kw{box off} simply
+      deletes them --- either way no orphan slab leaks. Wall indices
+      are tracked through every \kw{del} renumbering, so deleting a
+      non-wall object never confuses the box.
+\item \kw{box off} replies \code{box removed (6 wall(s) deleted,
+      indices renumbered)} --- or \code{box: none} if there was
+      nothing to remove; bare \kw{box} reports the size and wall
+      handles, or \code{box: none (BOX <size> creates one)}.
+\item A \kw{scene} window draws the box as a \textbf{dashed interior
+      wireframe}; the wall slabs themselves are not drawn as bodies.
+      Creating a box while a window is open appends a reminder to the
+      reply: \code{(scene window open: SCENE REFRESH shows the box)}.
+      \kw{reset} re-syncs an open window to the now-empty system
+      \textbf{and clears its box wireframe and wall flags} --- no
+      stale overlay survives the wipe.
+\end{itemize}
+
+\section{The notebook (cells, editing, magics)}
+
+\subsection{Cells}
+Start \code{posim} with no arguments. You get numbered prompts, exactly
+like Jupyter or Mathematica:
+\begin{lstlisting}
+In[1]:= new sphere { mass = 2, radius = 0.5 }
+Out[1]= obj0
+In[2]:= get obj0.inertia_tensor
+Out[2]= [[0.2, 0, 0], [0, 0.2, 0], [0, 0, 0.2]]
+\end{lstlisting}
+Pressing \textbf{Enter executes the cell} --- in a plain terminal, Enter
+\emph{is} shift-enter. Commands with no interesting result (like
+\kw{set}) print no \code{Out[n]}. Errors print \code{Err[n]:} and the
+session continues.
+
+\subsection{State is cumulative}
+Like Jupyter, the notebook has one live simulator state that every cell
+mutates in order. Re-running an old \kw{new} cell creates a \emph{new}
+object; it does not replace the old one. To rebuild cleanly,
+\code{\%reset} and replay.
+
+\subsection{Magics}\label{sec:magics}
+\begin{center}
+\begin{tabular}{lp{9.8cm}}
+\textbf{magic} & \textbf{effect}\\\hline
+\code{\%history} & lists every cell with input and output; failed cells marked \code{!}\\
+\code{\%edit n <text>} & replaces cell $n$'s input and executes it as the next cell\\
+\code{\%rerun n} & executes cell $n$'s input again as a new cell\\
+\code{\%save <file>} & writes all successful non-magic inputs to a replayable script\\
+\code{\%load <file>} & replays a script file cell by cell\\
+\code{\%reset} & clears the simulator (history kept)\\
+\code{\%quit}, \code{\%exit} & leave\\
+\end{tabular}
+\end{center}
+
+A plain terminal has no cursor-addressable cells (posim uses only the
+Rust standard library --- no raw terminal mode), so backward/forward
+movement is by these magics. \textbf{For true click-and-edit cells with
+shift-enter, use the JupyterLab front end} (\S\ref{sec:jlab}).
+
+\subsection{Scripts}
+\code{posim --script file} executes a file of command lines (blank lines
+and \code{\#} comments skipped), echoing \code{In[n]}/\code{Out[n]}, and
+exits nonzero if any cell failed --- good for CI.
+
+\section{JupyterLab in one paragraph}\label{sec:jlab}
+
+The \code{jupyter/} directory ships a small \emph{wrapper kernel}:
+JupyterLab starts a Python shim, the shim starts \code{posim --machine}
+(a JSON request/reply protocol over stdin/stdout), and each notebook
+cell you shift-enter is forwarded line-by-line as
+\code{\{"op":"exec","code":...\}}. Setup and tests:
+\code{jupyter/README.md}. Everything in \S\S2--5 applies verbatim inside
+JupyterLab cells; multi-line cells run one line at a time, stopping at
+the first error.
+
+\section{The stack machine (what runs your line)}
+
+The parser emits \emph{postfix instructions}; e.g.\
+\code{set obj0.mass = 2 + 3 * 4} compiles to
+\begin{lstlisting}
+Push 2
+Push 3
+Push 4
+Mul               <- pops 3,4  pushes 12
+Add               <- pops 2,12 pushes 14
+Store obj0.mass   <- pops 14, calls set_mass(14)
+\end{lstlisting}
+The machine's whole memory is a stack of typed values. Instructions:
+\code{Push}, \code{Load}, \code{Store}, \code{Add Sub Mul Div Neg},
+\code{PackList} (literals), \code{Call} (builtins),
+\code{NewObject}/\code{InitField}/\code{FinishNew}, \code{Delete},
+\code{ListObjects}, \code{Step}, \code{Run}, \code{SetMethod},
+\code{Energy}, \code{CenterOfMass}, \code{TotalMomentum},
+\code{TotalAngularMomentum}, \code{Laplace}, \code{Reset}, \code{Help}.
+\code{Load}/\code{Store} go \emph{only} through the
+\code{physical\_object} get/set API --- the machine cannot corrupt
+simulator state, and every coupled invariant (mass$\leftrightarrow$inverse,
+inertia$\leftrightarrow$inverse, unit quaternions) is enforced on every
+write. When the program ends, the top of the stack becomes \code{Out[n]}.
+
+\section{Thirteen worked examples}
+
+All transcripts are genuine program output.
+
+\subsection{Example 1 --- an eccentric Kepler orbit and the Runge--Lenz compass}
+
+The Laplace--Runge--Lenz vector $\mathbf A$ points along a Kepler
+orbit's major axis and is conserved \emph{only} for a perfect $1/r^2$
+force --- the most delicate conservation test available. We build a
+``sun'' so heavy the reduced problem is exact and integrate two orbits
+with a 4th-order \emph{symplectic} method.
+
+\begin{lstlisting}
+In[1]:= new point { mass = 1e9, position = [0, 0, 0] }
+Out[1]= obj0
+In[2]:= new point { mass = 1, position = [0.4, 0, 0], velocity = [0, 2, 0] }
+Out[2]= obj1
+In[3]:= set system.g_constant = 1e-9
+In[4]:= set system.softening = 0
+In[5]:= laplace 1
+Out[5]= [0.5999999974000001, 0, 0]
+In[6]:= method sprk mclachlan_4_4 0.001
+Out[6]= method = ARKODE SPRK ARKODE_SPRK_MCLACHLAN_4_4, fixed dt = 0.001
+In[7]:= run 12.6 steps 2
+Out[7]= t = 12.6 (12600 solver steps, 2 snapshots, |dE/E| = 9.237e-14)
+In[8]:= laplace 1
+Out[8]= [0.5999999974140128, -0.00000000034051644837163053, 0]
+In[9]:= get obj1.position
+Out[9]= [0.3964802853115723, 0.06706198328283366, 0]
+\end{lstlisting}
+
+\emph{What to notice.} \code{g\_constant = 1e-9} makes
+$G M_{\text{total}} = 1$ so the orbit has period $2\pi$. \kw{laplace}~1
+divided by $mk$ is the \emph{eccentricity vector}: $e = 0.6$ is read
+directly off \code{Out[5]}. After $\sim$2 orbits the energy is conserved
+to $9\times10^{-14}$ and $\mathbf A$ has rotated by only
+$3\times10^{-10}$ --- no spurious perihelion precession. Softening was
+zeroed because any $\varepsilon\ne 0$ slightly breaks the $1/r^2$ law
+and \emph{would} precess the axis.
+
+\subsection{Example 2 --- a thrown ball vs.\ the textbook formula}
+
+A projectile has the closed form $x(t)=v_x t$,
+$y(t)=y_0+v_y t-\tfrac12 g t^2$. We fly a baseball for 6.12\,s and
+subtract the formula \emph{inside the notebook} using bare expressions.
+
+\begin{lstlisting}
+In[1]:= new point { mass = 0.145, position = [0, 1, 0], velocity = [30, 30, 0] }
+Out[1]= obj0
+In[2]:= set system.gravity = [0, -9.81, 0]
+In[3]:= run 6.12 steps 3
+Out[3]= t = 6.12 (13 solver steps, 3 snapshots, |dE/E| = 4.740e-15)
+In[4]:= get obj0.position.x
+Out[4]= 183.5999999999999
+In[5]:= 30 * 6.12
+Out[5]= 183.6
+In[6]:= obj0.position.x - 30 * 6.12
+Out[6]= -0.00000000000008526512829121202
+In[7]:= obj0.position.y - (1 + 30 * 6.12 - 9.81 / 2 * 6.12 * 6.12)
+Out[7]= -0.0000000000004263256414560601
+\end{lstlisting}
+
+\emph{What to notice.} Cells 6--7 are \emph{bare expressions} mixing
+paths and arithmetic (\kw{get} itself would refuse the arithmetic). The
+trajectory matches the parabola to $\sim\!10^{-13}$ --- and the adaptive
+Adams integrator needed only \textbf{13 internal steps}, because for a
+polynomial solution its error estimator lets it take huge strides.
+
+\subsection{Example 3 --- cyclotron motion: expressions as arguments}
+
+A charge in a uniform magnetic field circles with period
+$T = 2\pi m/(|q|B)$. We \emph{compute $T$ inside the \kw{run} command}.
+
+\begin{lstlisting}
+In[1]:= new sphere { mass = 2, radius = 0.1, charge = -1.5, velocity = [3, 0, 0] }
+Out[1]= obj0
+In[2]:= set system.b_field = [0, 0, 4]
+In[3]:= method bdf
+Out[3]= method = CVODE BDF
+In[4]:= 2 * pi * 2 / (1.5 * 4)
+Out[4]= 2.0943951023931953
+In[5]:= run 2 * pi * 2 / (1.5 * 4) steps 8
+Out[5]= t = 2.0943951023931953 (318 solver steps, 8 snapshots, |dE/E| = 1.444e-8)
+In[6]:= get obj0.position
+Out[6]= [0.00000000043106769672882073, 0.000000007220835657713453, 0]
+In[7]:= norm(obj0.velocity)
+Out[7]= 2.9999999783374913
+\end{lstlisting}
+
+\emph{What to notice.} After one analytic period the particle is back at
+the origin to $7\times10^{-9}$, and \code{norm()} shows the speed
+unchanged --- the magnetic force does no work. The Lorentz force
+$q\,v\times B$ is velocity-dependent, so the symplectic path is
+\emph{not allowed} here; \kw{bdf} is the right tool for fast gyration.
+
+\subsection{Example 4 --- the tennis-racket theorem (Dzhanibekov effect)}
+
+A rigid body spun about its \emph{intermediate} principal axis is
+unstable: a tiny wobble grows into a dramatic flip, yet energy and
+angular momentum stay conserved. Half-extents \code{[0.5, 1, 2]} give
+moments $[5, 4.25, 1.25]$; spinning about $y$ (the middle value)
+triggers it.
+
+\begin{lstlisting}
+In[1]:= new cuboid { mass = 3, half_extents = [0.5, 1, 2], angular_velocity = [0.01, 3, 0.01] }
+Out[1]= obj0
+In[2]:= get obj0.inertia_tensor
+Out[2]= [[5, 0, 0], [0, 4.25, 0], [0, 0, 1.25]]
+In[3]:= get obj0.angular_velocity
+Out[3]= [0.010000000000000002, 3, 0.010000000000000002]
+In[4]:= run 40 steps 4
+Out[4]= t = 40 (2361 solver steps, 4 snapshots, |dE/E| = 5.605e-9)
+In[5]:= get obj0.angular_velocity
+Out[5]= [1.5428438559953521, 2.9947703802651175, -0.7871804456905063]
+In[6]:= run 40 steps 4
+Out[6]= t = 80 (2334 solver steps, 4 snapshots, |dE/E| = 5.332e-9)
+In[7]:= get obj0.angular_velocity
+Out[7]= [0.020666590902422656, 2.9999548562146483, 0.013346831306280834]
+In[8]:= get obj0.angular_momentum
+Out[8]= [0.05, 12.75, 0.0125]
+\end{lstlisting}
+
+\emph{What to notice.} At $t=40$ the wobble has exploded
+($\omega_x\approx1.54$, mid-flip); by $t=80$ the body has completed the
+flip and returned to a clean spin. Throughout, the world-frame angular
+momentum (\code{Out[8]}) is exactly the initial
+$I\omega = [0.05, 12.75, 0.0125]$ --- the solver integrates the full
+quaternion + angular-momentum state with energy error
+$\sim 5\times10^{-9}$.
+
+\subsection{Example 5 --- three bodies, then surgery with \kw{del}}
+
+\begin{lstlisting}
+In[1]:= new point { mass = 1,   position = [1, 0, 0],  velocity = [0, 1, 0] }
+Out[1]= obj0
+In[2]:= new point { mass = 4,   position = [-1, 0, 0], velocity = [0, -0.25, 0] }
+Out[2]= obj1
+In[3]:= new point { mass = 256, position = [0, 8, 0],  velocity = [0, 0, 0] }
+Out[3]= obj2
+In[4]:= set system.g_constant = 0.001
+In[5]:= momentum
+Out[5]= [0, 0, 0]
+In[6]:= com
+Out[6]= [-0.011494252873563218, 7.846743295019157, 0]
+In[7]:= run 3 steps 3
+Out[7]= t = 3 (84 solver steps, 3 snapshots, |dE/E| = 3.141e-10)
+In[8]:= list
+Out[8]= obj0: point, mass=1, charge=0, pos=[0.9936356911262184, 3.022315903943394, 0]
+obj1: point, mass=4, charge=0, pos=[-0.9972663866755148, -0.7330950497234504, 0]
+obj2: point, mass=256, charge=0, pos=[-0.000017852126656859762, 7.999648688652149, 0]
+In[9]:= del 2
+Out[9]= deleted obj2; 2 object(s) remain (indices renumbered)
+In[10]:= list
+Out[10]= obj0: point, mass=1, charge=0, pos=[0.9936356911262184, 3.022315903943394, 0]
+obj1: point, mass=4, charge=0, pos=[-0.9972663866755148, -0.7330950497234504, 0]
+In[11]:= momentum
+Out[11]= [0.0021430470372574067, 0.061528401914275554, 0]
+\end{lstlisting}
+
+\emph{What to notice.} Cells 1--3 chose velocities so the initial total
+momentum is exactly zero ($1\cdot1 + 4\cdot(-0.25) = 0$), and it stays
+zero through the run. Deleting the heavy body removes its momentum: the
+remainder (\code{Out[11]}) is what the surviving pair carries ---
+conservation applies to the system you keep. \kw{del} renumbers later
+objects.
+
+\subsection{Example 6 --- magnetic torque (and why \kw{energy} grows)}
+
+$\code{magnetic\_moment\_tensor}$ $M$ couples the world $B$ field to
+torque $\tau = (RMR^{\mathsf T})B$. Unlike everything else, this
+coupling is \emph{not derived from a potential}, so total energy is
+\emph{expected} to change.
+
+\begin{lstlisting}
+In[1]:= new sphere { mass = 1, radius = 0.5, magnetic_moment_tensor = [[0.2, 0, 0], [0, 0.2, 0], [0, 0, 0.2]] }
+Out[1]= obj0
+In[2]:= set system.b_field = [0, 0.5, 0]
+In[3]:= get obj0.angular_momentum
+Out[3]= [0, 0, 0]
+In[4]:= energy
+Out[4]= 0
+In[5]:= run 4 steps 4
+Out[5]= t = 4 (214 solver steps, 4 snapshots, |dE/E| = 8.000e-1)
+In[6]:= get obj0.angular_momentum
+Out[6]= [0, 0.40000000000000085, 0]
+In[7]:= get obj0.angular_velocity
+Out[7]= [0, 4.000000000000009, 0]
+In[8]:= energy
+Out[8]= 0.8000000000000035
+\end{lstlisting}
+
+\emph{What to notice.} Constant torque $\tau = MB = 0.2\times0.5 = 0.1$
+about $y$ gives $L(t) = 0.1t$: after 4\,s, $L = 0.4$ exactly (the ODE is
+linear, so the solver nails it). Sphere inertia
+$= 0.4\cdot1\cdot0.25 = 0.1$, so $\omega = L/I = 4$ and the rotational
+energy $\tfrac12\omega L = 0.8$ matches \code{Out[8]}. The reported
+\code{|dE/E| = 8e-1} is not an error --- it honestly reports that the
+torque pumped energy in.
+
+\subsection{Example 7 --- fixing a typo in an old cell with \code{\%edit}}
+
+\begin{lstlisting}
+In[1]:= new sphere { mass = 20, radius = 0.5 }
+Out[1]= obj0
+In[2]:= set obj0.velocity = [1, 0, 0]
+In[3]:= get obj0.momentum
+Out[3]= [20, 0, 0]
+In[4]:= %edit 1 new sphere { mass = 2, radius = 0.5 }
+In[4]:= new sphere { mass = 2, radius = 0.5 }
+Out[4]= obj1
+In[5]:= %history
+ In[1]:= new sphere { mass = 2, radius = 0.5 }
+  Out[1]= obj0
+ In[2]:= set obj0.velocity = [1, 0, 0]
+ In[3]:= get obj0.momentum
+  Out[3]= [20, 0, 0]
+ In[4]:= new sphere { mass = 2, radius = 0.5 }
+  Out[4]= obj1
+\end{lstlisting}
+
+\emph{What to notice.} \code{\%edit 1 ...} rewrites cell 1's stored
+input \textbf{and re-executes it as the next cell} --- like editing a
+Jupyter cell and shift-entering again. Because state is cumulative, the
+re-executed \kw{new} made a \emph{second} object; the fat \code{obj0} is
+still there. For a clean rebuild use \code{\%reset} + \code{\%rerun} or
+\code{\%load}; when a field tweak suffices, \code{set obj0.mass = 2}.
+\code{\%history} shows the \emph{edited} input but the \emph{original}
+outputs --- an audit trail of what actually ran.
+
+\subsection{Example 8 --- checking the simulator against itself}
+
+\begin{lstlisting}
+In[1]:= new point { mass = 2, position = [1, 0, 0], velocity = [0, 3, 0] }
+Out[1]= obj0
+In[2]:= cross(obj0.position, obj0.momentum)
+Out[2]= [0, 0, 6]
+In[3]:= angmom
+Out[3]= [0, 0, 6]
+In[4]:= dot(obj0.position, obj0.velocity)
+Out[4]= 0
+In[5]:= norm(cross(obj0.position, obj0.momentum)) / (norm(obj0.position) * norm(obj0.momentum))
+Out[5]= 1
+\end{lstlisting}
+
+\emph{What to notice.} Cell 2 computes $L = r\times p$ by hand and cell
+3 confirms \kw{angmom} agrees. Cell 4 proves $r\perp v$; cell 5 computes
+$|r\times p|/(|r||p|) = \sin\theta = 1$ --- the angle between $r$ and
+$p$ is $90^\circ$ --- inside one nested expression.
+
+\subsection{Example 9 --- hand-built tensors and a quaternion orientation}
+
+\begin{lstlisting}
+In[1]:= new cuboid { mass = 1, inertia_tensor = [[2, 0, 0], [0, 3, 0], [0, 0, 4]], orientation = [0.7071067811865476, 0, 0, 0.7071067811865476] }
+Out[1]= obj0
+In[2]:= get obj0.inverse_inertia_tensor
+Out[2]= [[0.5, 0, 0], [0, 0.3333333333333333, 0], [0, 0, 0.25]]
+In[3]:= set obj0.angular_velocity = [0, 2, 0]
+In[4]:= get obj0.angular_momentum
+Out[4]= [0.0000000000000004440892098500628, 4.000000000000002, 0]
+In[5]:= get obj0.orientation
+Out[5]= quat[w=0.7071067811865476, x=0, y=0, z=0.7071067811865476]
+\end{lstlisting}
+
+\emph{What to notice.} Because \code{inertia\_tensor} appears in the
+initializer, the analytic inertia is \textbf{not} recomputed --- your
+$\mathrm{diag}(2,3,4)$ is kept, with the inverse maintained
+automatically. The quaternion $[w,x,y,z] = [\sqrt{1/2},0,0,\sqrt{1/2}]$
+is a $90^\circ$ rotation about $z$, so setting the \emph{world} angular
+velocity $[0,2,0]$ exercises the full $L = (R I R^{\mathsf T})\omega$
+transformation. By hand: rotating $\mathrm{diag}(2,3,4)$ by $90^\circ$
+about $z$ swaps the $x$ and $y$ moments, so
+$R I R^{\mathsf T} = \mathrm{diag}(3,2,4)$, the world-$y$ moment is 2,
+and $L = [0, 4, 0]$ --- exactly \code{Out[4]} (up to $4\times10^{-16}$
+of floating-point dust).
+
+\subsection{Example 10 --- reproducibility: \code{\%save}, \code{\%reset}, \code{\%load}}
+
+\begin{lstlisting}
+In[1]:= new sphere { mass = 2, radius = 0.5, velocity = [1, 0, 0] }
+Out[1]= obj0
+In[2]:= set system.gravity = [0, -9.81, 0]
+In[3]:= step 0.5
+Out[3]= t = 0.5 (advanced by 0.5, 12 solver steps)
+In[4]:= %save session.posim
+saved 3 cell(s) to session.posim
+In[5]:= %reset
+system reset
+In[6]:= list
+Out[6]= (no objects)
+In[7]:= %load session.posim
+In[7]:= new sphere { mass = 2, radius = 0.5, velocity = [1, 0, 0] }
+Out[7]= obj0
+In[8]:= set system.gravity = [0, -9.81, 0]
+In[9]:= step 0.5
+Out[9]= t = 0.5 (advanced by 0.5, 12 solver steps)
+In[10]:= get obj0.velocity
+Out[10]= [1, -4.905000000000001, 0]
+\end{lstlisting}
+
+\emph{What to notice.} \code{\%save} writes only the successful,
+non-magic inputs --- a clean, replayable script. After \code{\%reset},
+\code{\%load} replays it and the state is bit-identical
+($v_y = -9.81\cdot0.5 = -4.905$). The same file runs headlessly via
+\code{posim --script}. The machine mode speaks the same language over
+JSON:
+
+\begin{lstlisting}
+$ printf '%s\n' '{"op":"exec","code":"new point { mass = 1, velocity = [0, 1, 0] }"}' \
+                '{"op":"get","path":"obj0.momentum"}' \
+                '{"op":"set","path":"obj0.mass","value":5}' \
+                '{"op":"get","path":"obj0.momentum"}' | posim --machine
+{"display":"obj0","ok":true,"result":"obj0"}
+{"display":"[0, 1, 0]","ok":true,"result":[0.0,1.0,0.0]}
+{"display":"","ok":true,"result":null}
+{"display":"[0, 1, 0]","ok":true,"result":[0.0,1.0,0.0]}
+\end{lstlisting}
+
+Changing the mass did \textbf{not} change the momentum --- momentum is
+the canonical stored state; the \emph{velocity} is what changed. That
+final subtlety is the union design showing through the wire protocol.
+
+\subsection{Example 11 --- watching a Kepler orbit live, then running it backward}
+
+The same two-body setup as Example 1 --- but this time we \emph{watch}
+it. \kw{scene create} opens the scene window in the browser;
+\kw{scene start} sets it in motion; \kw{scene reverse} runs the movie
+backward.
+
+\begin{lstlisting}
+In[1]:= new point { mass = 1e9, position = [0, 0, 0] }
+Out[1]= obj0
+In[2]:= new point { mass = 1, position = [0.4, 0, 0], velocity = [0, 2, 0] }
+Out[2]= obj1
+In[3]:= set system.g_constant = 1e-9
+In[4]:= set system.softening = 0
+In[5]:= scene create 7878
+Out[5]= scene window created: http://127.0.0.1:7878/
+(opened in your browser; if no window appeared, open that address yourself)
+showing 2 entities; SCENE START begins the evolution — HELP lists all scene commands
+In[6]:= scene set_time_step 0.005
+Out[6]= scene time step dt = 0.005
+In[7]:= scene start
+Out[7]= scene playback: running
+In[8]:= scene pause
+Out[8]= scene playback: paused
+In[9]:= scene status
+Out[9]= scene: http://127.0.0.1:7878/  (1 window(s) connected)
+mode = paused, t = 0.4550000000000003, dt = 0.005, steps = 91, history = 91 frame(s)
+entities = 2 (hidden: none)
+camera: yaw = -60°, pitch = 55°, dist = 12, target = [0, 0, 0]
+In[10]:= scene reverse
+Out[10]= scene playback: reversing
+In[11]:= scene status
+Out[11]= scene: http://127.0.0.1:7878/  (1 window(s) connected)
+mode = reversing, t = 0.15500000000000005, dt = 0.005, steps = 91, history = 31 frame(s)
+entities = 2 (hidden: none)
+camera: yaw = -60°, pitch = 55°, dist = 12, target = [0, 0, 0]
+In[12]:= scene events
+Out[12]= window connected (1 total)
+In[13]:= scene close
+Out[13]= scene closed (http://127.0.0.1:7878/)
+\end{lstlisting}
+
+\emph{What to notice.} Between \code{In[7]} and \code{In[8]} a few
+real seconds passed while the orbit ran in the window --- playback
+happens on a background thread at $\sim$30 frames per second, so
+\textbf{the notebook prompt never blocks}: cell 9's \kw{status} shows
+the \emph{playback copy} has advanced 91 steps to $t \approx 0.455$
+while your notebook state still sits untouched at $t = 0$ (that is the
+``playback copy'' design: the window animates its own synchronized
+copy of your system, so \code{GET system.time} here would still print
+\code{0}). After \kw{reverse} (cell 10), the status in cell 11 shows
+time flowing \emph{backward} ($t \approx 0.155$) and the history
+buffer draining ($91 \to 31$ frames): each reversed frame is an exact
+recorded snapshot, so the rewind retraces the orbit bit-for-bit. Cell
+12 drains the asynchronous event queue --- the window announced itself
+when the browser connected. In JupyterLab you would not even need cell
+12: events surface on their own as \code{[scene] ...} lines
+(\S\ref{sec:jlab}).
+
+\subsection{Example 12 --- driving the camera from the notebook}
+
+Every gesture the mouse can make in the window has a command twin, so
+a \emph{script} can compose the exact view you want --- useful for
+repeatable demonstrations and screenshots.
+
+\begin{lstlisting}
+In[1]:= new sphere { mass = 3, radius = 0.6, position = [2, 0, 0] }
+Out[1]= obj0
+In[2]:= new cuboid { mass = 1, half_extents = [0.4, 0.3, 0.2], position = [-2, 0, 1] }
+Out[2]= obj1
+In[3]:= scene create 7878
+Out[3]= scene window created: http://127.0.0.1:7878/
+(opened in your browser; if no window appeared, open that address yourself)
+showing 2 entities; SCENE START begins the evolution — HELP lists all scene commands
+In[4]:= scene translate 2 0
+Out[4]= camera target = [2, 0, 0]
+In[5]:= scene rotate 30 -10
+Out[5]= camera yaw = -30°, pitch = 45°
+In[6]:= scene zoom in
+Out[6]= camera distance = 9.6
+In[7]:= scene zoom 2
+Out[7]= camera distance = 4.8
+In[8]:= scene zoom out
+Out[8]= camera distance = 5.999999999999999
+In[9]:= scene hide 0
+Out[9]= 1 object(s) hidden
+In[10]:= scene show all
+Out[10]= 0 object(s) hidden
+In[11]:= scene redraw
+Out[11]= scene redraw queued for every window
+In[12]:= scene status
+Out[12]= scene: http://127.0.0.1:7878/  (0 window(s) connected)
+mode = stopped, t = 0, dt = 0.01, steps = 0, history = 0 frame(s)
+entities = 2 (hidden: none)
+camera: yaw = -30°, pitch = 45°, dist = 5.999999999999999, target = [2, 0, 0]
+In[13]:= scene close
+Out[13]= scene closed (http://127.0.0.1:7878/)
+\end{lstlisting}
+
+\emph{What to notice.} The camera is an \textbf{orbit camera}: it
+circles a \emph{look-at point} at a \emph{distance}, aimed by
+\emph{yaw} (compass direction) and \emph{pitch} (elevation).
+\kw{translate} \code{2 0} moves the look-at point onto the sphere
+(this is what the arrow keys do in the window); \kw{rotate}
+\code{30 -10} adds $30^\circ$ of yaw to the default $-60^\circ$ and
+$-10^\circ$ of pitch to the default $55^\circ$ (this is what
+left-dragging does); the three zooms multiply the distance by
+$1/1.25$, then $1/2$, then $1.25$ --- watch the arithmetic:
+$12 \to 9.6 \to 4.8 \to 6$ (this is the mouse wheel). \kw{hide}
+\code{0} blanks the sphere out of every connected window without
+deleting anything --- \kw{show all} brings it back. Because this
+transcript ran headless, cell 12 reports \code{0 window(s) connected}
+--- the commands work regardless, and any window that connects later
+receives the composed view. Note also the two-argument form
+\code{scene translate 2 0}: the optional \code{dz} defaulted to 0, and
+\code{-10} in cell 5 was one negative argument, not a subtraction
+(scene arguments are \emph{terms} --- the second subtlety of \S3).
+
+\subsection{Example 13 --- the box of shapes: every body type in a rigid, infinitely massive box}
+
+The finale scene: \kw{box} 4 builds the rigid room (\S\ref{sec:box})
+and one of every shape goes inside ($R = 1$, $M = 1$) --- a
+\textbf{torus} (mass $M$, inner radius 1, outer radius 2), a
+\textbf{point} ($M$, the only mover: $v = (100, 200, 100)$), a
+\textbf{sphere} ($2M$, $r = \tfrac12$), an ideal zero-thickness
+\textbf{disk} ($2M/3$, $r = 1$), a \textbf{cube} ($5M/3$, side 1) and
+a \textbf{cylinder} ($2M$, $r = \tfrac12$, height $3/2$). An
+axis-aligned torus of outer radius 2 would \emph{exactly inscribe} the
+4-box (its outer equator touching four walls), so the torus is tilted
+with its axis along $(1,1,1)/\sqrt3$: its extent per axis is
+$1.5\sqrt{2/3} + 0.5 \approx 1.7247 < 2$ --- clearance 0.2753. The
+other positions are random, drawn by a documented LCG
+($x \leftarrow 1664525\,x + 1013904223 \bmod 2^{32}$, seed 20260724,
+sequential rejection at $\ge 0.05$ separation) --- see
+\code{scripts/collisions/11\_box\_of\_shapes.posim}, the script this
+transcript replays.
+
+\begin{lstlisting}
+In[1]:= set system.g_constant = 0
+In[2]:= box 4
+Out[2]= box: inner size 4 x 4 x 4 — six static walls obj0, obj1, obj2, obj3, obj4, obj5 with inverse_mass = 0 (infinitely massive); objects collide elastically off the inside faces
+In[3]:= new torus { mass = 1, inner_radius = 1, outer_radius = 2, orientation = [0.888073833977115, -0.325057583671868, 0.325057583671868, 0] }
+Out[3]= obj6
+In[4]:= new point { mass = 1, position = [1.406590, -0.995859, 0.569601], velocity = [100, 200, 100] }
+Out[4]= obj7
+In[5]:= new sphere { mass = 2, radius = 1/2, position = [1.424704, 1.367496, -0.493612] }
+Out[5]= obj8
+In[6]:= new disk { mass = 2/3, radius = 1, position = [-0.677386, -1.041493, -1.091679], orientation = [0.900447102352677, 0.307567078752479, -0.307567078752479, 0] }
+Out[6]= obj9
+In[7]:= new cuboid { mass = 5/3, half_extents = [0.5, 0.5, 0.5], position = [1.074397, 0.816223, 1.102099] }
+Out[7]= obj10
+In[8]:= new cylinder { mass = 2, radius = 1/2, height = 3/2, position = [-1.027024, -1.403890, -0.485619], orientation = [0.968912421710645, 0, 0.247403959254523, 0] }
+Out[8]= obj11
+In[9]:= list
+Out[9]= obj0: cuboid he=[1, 4, 4], mass=0, charge=0, pos=[3, 0, 0] [wall: static, inverse_mass=0]
+obj1: cuboid he=[1, 4, 4], mass=0, charge=0, pos=[-3, 0, 0] [wall: static, inverse_mass=0]
+obj2: cuboid he=[4, 1, 4], mass=0, charge=0, pos=[0, 3, 0] [wall: static, inverse_mass=0]
+obj3: cuboid he=[4, 1, 4], mass=0, charge=0, pos=[0, -3, 0] [wall: static, inverse_mass=0]
+obj4: cuboid he=[4, 4, 1], mass=0, charge=0, pos=[0, 0, 3] [wall: static, inverse_mass=0]
+obj5: cuboid he=[4, 4, 1], mass=0, charge=0, pos=[0, 0, -3] [wall: static, inverse_mass=0]
+obj6: torus ring=1.5 tube=0.5, mass=1, charge=0, pos=[0, 0, 0]
+obj7: point, mass=1, charge=0, pos=[1.40659, -0.995859, 0.569601]
+obj8: sphere r=0.5, mass=2, charge=0, pos=[1.424704, 1.367496, -0.493612]
+obj9: disk r=1, mass=0.6666666666666666, charge=0, pos=[-0.677386, -1.041493, -1.091679]
+obj10: cuboid he=[0.5, 0.5, 0.5], mass=1.6666666666666667, charge=0, pos=[1.074397, 0.816223, 1.102099]
+obj11: cylinder r=0.5 h=1.5, mass=2, charge=0, pos=[-1.027024, -1.40389, -0.485619]
+In[10]:= collide
+Out[10]= collisions ON (51 collidable pair(s); 0 impulse(s) so far)
+In[11]:= get obj0.inverse_mass
+Out[11]= 0
+In[12]:= get obj6.inertia_tensor
+Out[12]= [[1.28125, 0, 0], [0, 1.28125, 0], [0, 0, 2.4375]]
+In[13]:= energy
+Out[13]= 30000
+In[14]:= momentum
+Out[14]= [100, 200, 100]
+In[15]:= run 0.1 steps 100
+Out[15]= t = 0.1 (2259 solver steps, 100 snapshots, |dE/E| = 1.031e-9, 132 collision(s) — CONTACTS lists them)
+In[16]:= energy
+Out[16]= 29999.999969060293
+In[17]:= momentum
+Out[17]= [243.5927833501326, -82.35240150995011, -4.548943318788247]
+In[18]:= get system.collisions
+Out[18]= 132
+In[19]:= get system.box
+Out[19]= 4
+\end{lstlisting}
+
+\emph{What to notice.} Cell 3 sizes the torus by the order-independent
+\code{inner\_radius} + \code{outer\_radius} pair; cell 8 uses
+\code{height = 3/2} --- the \emph{full} height, so \code{half\_height}
+reads 0.75. \kw{collide} counts \textbf{51 collidable pairs}: 12
+objects make 66 pairs, minus the 15 wall--wall pairs (two static
+bodies can never collide). \code{Out[12]} is the torus's analytic
+inertia $\mathrm{diag}(1.28125, 1.28125, 2.4375)$ --- exactly
+$I_{xy} = m(\tfrac12 c^2 + \tfrac58 a^2)$,
+$I_z = m(c^2 + \tfrac34 a^2)$ for $c = 1.5$, $a = 0.5$. The energy
+starts at $E_0 = \tfrac12\cdot 1\cdot|v|^2 = 30000$ \textbf{exactly}
+and, after \textbf{132 collisions} in 0.1\,s, is conserved to
+$|dE/E| = 1.031\times10^{-9}$ --- but momentum went from
+$(100, 200, 100)$ to $(243.59, -82.35, -4.55)$: \textbf{not
+conserved}, because the infinitely massive walls absorb momentum
+without moving --- the physical signature of infinite mass. Along the
+way the point particle can \emph{thread the torus hole} and passes
+through the ideal zero-thickness disk (a measure-zero contact) --- the
+ball-vs-anything collision tier is exact SDF geometry, not an
+approximation --- while every finite-size body bounces off both. The
+walls end the run bit-identically at rest.
+
+\section{Error message tour}
+
+\begin{center}
+\begin{tabular}{p{5.4cm}p{9.2cm}}
+\textbf{you type} & \textbf{you get}\\\hline
+\code{get obj7.mass} (no obj7) & \code{no object obj7}\\
+\code{get obj0.bogus} & \code{unknown object field `bogus' --- see HELP for the field list}\\
+\code{[1,0,0] * [0,1,0]} & \code{cannot multiply vec3 by vec3 (for vec3*vec3 use dot()/cross())}\\
+\code{set = 3} & \code{parse error at column 5: expected a path root (objN or system), found =}\\
+\code{run 1} under SPRK with $B\ne0$ & \code{SPRK method requires a separable Hamiltonian: magnetic field B must be zero ... use METHOD ADAMS or BDF}\\
+\code{bogusname} & \code{parse error ...: unknown name bogusname (expected a number, [x,y,z], objN.field, system.field, or a function call)}\\
+\end{tabular}
+\end{center}
+
+Every error names the column or the exact field/feature at fault, and
+never aborts the session.
+
+\end{document}

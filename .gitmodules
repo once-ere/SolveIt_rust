@@ -1,0 +1,7 @@
+[submodule "sundials_rs"]
+	path = sundials_rs
+	url = https://github.com/once-ere/sundials_rs.git
+	branch = main
+#[submodule "3rdparty/lzfse"]
+#	path = 3rdparty/lzfse
+#	url = https://github.com/lzfse/lzfse.git
