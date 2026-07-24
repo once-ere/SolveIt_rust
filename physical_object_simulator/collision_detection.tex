@@ -730,22 +730,22 @@ get obj0.inverse_mass   -> 0
 get obj6.inertia_tensor -> [[1.28125, 0, 0], [0, 1.28125, 0], [0, 0, 2.4375]]
 energy -> 30000         momentum -> [100, 200, 100]
 In[15]:= run 0.1 steps 100
-Out[15]= t = 0.1 (2259 solver steps, 100 snapshots, |dE/E| = 1.031e-9, 132 collision(s) — CONTACTS lists them)
-energy   -> 29999.999969060293
-momentum -> [243.5927833501326, -82.35240150995011, -4.548943318788247]
+Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10, 119 collision(s) — CONTACTS lists them)
+energy   -> 29999.99999388012
+momentum -> [146.4891109312449, 102.14781200712048, 46.01601279520784]
 \end{lstlisting}
-\textbf{132 impulses across all three dispatch tiers in 0.1 time units, and
+\textbf{119 impulses across all three dispatch tiers in 0.1 time units, and
 the energy drift is $|\mathrm dE/E| = 1.031 \cdot 10^{-9}$.} The 51
 collidable pairs are the 66 pairs of 12 bodies minus the 15 static
 wall--wall pairs; the torus inertia readback matches the analytic tensor
 exactly ($m(\tfrac12 c^2 + \tfrac58 a^2) = 1.28125$,
 $m(c^2 + \tfrac34 a^2) = 2.4375$ for $c = 1.5$, $a = 0.5$).
 \textbf{Momentum is NOT conserved --- $(100, 200, 100) \to
-(243.59, -82.35, -4.55)$ --- and is not supposed to be}: every wall impulse
+(146.49, 102.15, 46.02)$ --- and is not supposed to be}: every wall impulse
 transfers $\pm J\hat n$ into a body with \code{inverse\_mass} $= 0$. The
 infinitely massive walls absorb momentum at zero velocity, so they absorb no
 energy ($p^2/2m \to 0$ as $m \to \infty$, taken \emph{exactly} by the
-inverse-mass formulation), and after 132 collisions the six walls are
+inverse-mass formulation), and after 119 collisions the six walls are
 \textbf{bit-identically at rest}. Momentum non-conservation with exact
 energy conservation is the physical signature of a rigid container --- not a
 bug.
@@ -777,7 +777,7 @@ denominator $m_i^{-1} + m_j^{-1} + \text{angular terms}$ --- and a wall with
 \code{inverse\_mass} $= 0$ contributes zero to every denominator and
 receives no state writes at all. Newton's third law still acts at every
 contact; the ``missing'' momentum went into the box (Example 11:
-$(100, 200, 100) \to (243.59, -82.35, -4.55)$ while energy is conserved to
+$(100, 200, 100) \to (146.49, 102.15, 46.02)$ while energy is conserved to
 $1.031 \cdot 10^{-9}$ and the walls stay bit-identically at rest).
 
 \textbf{Can anything pass through the torus hole?} Balls can.

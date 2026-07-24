@@ -802,18 +802,18 @@ Out[13]= 30000
 In[14]:= momentum
 Out[14]= [100, 200, 100]
 In[15]:= run 0.1 steps 100
-Out[15]= t = 0.1 (2259 solver steps, 100 snapshots, |dE/E| = 1.031e-9, 132 collision(s) — CONTACTS lists them)
+Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10, 119 collision(s) — CONTACTS lists them)
 In[16]:= energy
-Out[16]= 29999.999969060293
+Out[16]= 29999.99999388012
 In[17]:= momentum
-Out[17]= [243.5927833501326, -82.35240150995011, -4.548943318788247]
+Out[17]= [146.4891109312449, 102.14781200712048, 46.01601279520784]
 ```
 
 *What to notice.* E₀ = ½·1·(100² + 200² + 100²) = **30000 exactly**
-(one mover). In 0.1 s the box produces **132 collisions** spanning all
+(one mover). In 0.1 s the box produces **119 collisions** spanning all
 three dispatch tiers of §10, and total energy survives every one of
 them to |dE/E| = 1.031×10⁻⁹. Momentum does **not** survive —
-(100, 200, 100) → (243.59, −82.35, −4.55) — and that is the *physical
+(100, 200, 100) → (146.49, 102.15, 46.02) — and that is the *physical
 signature* of the infinitely massive walls: they absorb momentum
 without moving (Δv = Δp·m⁻¹ = Δp·0), and after the run all six slabs
 are still bit-identically at rest. The 51 collidable pairs are

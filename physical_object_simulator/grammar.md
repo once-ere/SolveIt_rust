@@ -1194,11 +1194,11 @@ Out[13]= 30000
 In[14]:= momentum
 Out[14]= [100, 200, 100]
 In[15]:= run 0.1 steps 100
-Out[15]= t = 0.1 (2259 solver steps, 100 snapshots, |dE/E| = 1.031e-9, 132 collision(s) — CONTACTS lists them)
+Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10, 119 collision(s) — CONTACTS lists them)
 In[16]:= energy
-Out[16]= 29999.999969060293
+Out[16]= 29999.99999388012
 In[17]:= momentum
-Out[17]= [243.5927833501326, -82.35240150995011, -4.548943318788247]
+Out[17]= [146.4891109312449, 102.14781200712048, 46.01601279520784]
 In[18]:= get system.collisions
 Out[18]= 132
 In[19]:= get system.box
@@ -1213,9 +1213,9 @@ minus the 15 wall–wall pairs (two static bodies can never collide).
 `Out[12]` is the torus's analytic inertia diag(1.28125, 1.28125,
 2.4375) — exactly `I_xy = m(½c² + ⅝a²)`, `I_z = m(c² + ¾a²)` for
 c = 1.5, a = 0.5. The energy starts at E₀ = ½·1·|v|² = 30000
-**exactly** and, after **132 collisions** in 0.1 s, is conserved to
+**exactly** and, after **119 collisions** in 0.1 s, is conserved to
 |dE/E| = 1.031×10⁻⁹ — but momentum went from (100, 200, 100) to
-(243.59, −82.35, −4.55): **not conserved**, because the infinitely
+(146.49, 102.15, 46.02): **not conserved**, because the infinitely
 massive walls absorb momentum without moving (§5.8) — the physical
 signature of infinite mass. Along the way the point particle can
 *thread the torus hole* and passes through the ideal zero-thickness

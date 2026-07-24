@@ -762,21 +762,21 @@ In[12]:= get obj6.inertia_tensor  → [[1.28125, 0, 0], [0, 1.28125, 0], [0, 0, 
 In[13]:= energy                   → 30000
 In[14]:= momentum                 → [100, 200, 100]
 In[15]:= run 0.1 steps 100
-Out[15]= t = 0.1 (2259 solver steps, 100 snapshots, |dE/E| = 1.031e-9, 132 collision(s) — CONTACTS lists them)
-In[16]:= energy                   → 29999.999969060293
-In[17]:= momentum                 → [243.5927833501326, -82.35240150995011, -4.548943318788247]
+Out[15]= t = 0.1 (2121 solver steps, 100 snapshots, |dE/E| = 2.040e-10, 119 collision(s) — CONTACTS lists them)
+In[16]:= energy                   → 29999.99999388012
+In[17]:= momentum                 → [146.4891109312449, 102.14781200712048, 46.01601279520784]
 ```
 
-**132 impulses across all three dispatch tiers in 0.1 time units, and the
-energy drift is |dE/E| = 1.031e-9.** The 51 collidable pairs are the 66
+**119 impulses across all three dispatch tiers in 0.1 time units, and the
+energy drift is |dE/E| = 2.040e-10.** The 51 collidable pairs are the 66
 pairs of 12 bodies minus the 15 static wall-wall pairs; the torus inertia
 readback matches the analytic tensor exactly (m(½c² + ⅝a²) = 1.28125,
 m(c² + ¾a²) = 2.4375 for c = 1.5, a = 0.5). **Momentum is NOT conserved —
-(100, 200, 100) → (243.59, −82.35, −4.55) — and is not supposed to be**:
+(100, 200, 100) → (146.49, 102.15, 46.02) — and is not supposed to be**:
 every wall impulse transfers ±Jn̂ into a body with `inverse_mass = 0`. The
 infinitely massive walls absorb momentum at zero velocity, so they absorb no
 energy (p²/2m → 0 as m → ∞, taken *exactly* by the inverse-mass
-formulation), and after 132 collisions the six walls are **bit-identically
+formulation), and after 119 collisions the six walls are **bit-identically
 at rest**. Momentum non-conservation with exact energy conservation is the
 physical signature of a rigid container — not a bug.
 
@@ -808,8 +808,8 @@ the limit is *exact*, because the equations of motion only ever use the
 `n·Kn = m_i⁻¹ + m_j⁻¹ + angular terms` — and a wall with `inverse_mass = 0`
 contributes zero to every denominator and receives no state writes at all.
 Newton's third law still acts at every contact; the "missing" momentum went
-into the box (Example 11: (100, 200, 100) → (243.59, −82.35, −4.55) while
-energy is conserved to 1.031e-9 and the walls stay bit-identically at rest).
+into the box (Example 11: (100, 200, 100) → (146.49, 102.15, 46.02) while
+energy is conserved to 2.040e-10 and the walls stay bit-identically at rest).
 
 **Can anything pass through the torus hole?** Balls can. Ball-vs-anything
 uses the exact SDF, and on a line through the hole a small ball's separation
